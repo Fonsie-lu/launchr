@@ -1,0 +1,87 @@
+/* Tokyo Night (default) — this is a template, not standalone valid CSS: the
+   __TOKENS__ below are substituted by render_style() in main.rs from
+   Config::colors / Config::font_size before being loaded as a CSS provider.
+   Defaults: bg #10111e  panel #1a1b26  fg #c0caf5  selection #283457
+   accent #7aa2f7  muted #565f89 — see ~/.config/launchr.json in the README. */
+
+window.launchr {
+  background: transparent;
+}
+
+/* Fullscreen scrim, painted over the blurred screenshot the launcher takes of
+   the output itself. Alpha is overridden at runtime by --dim / "dim". */
+.dim {
+  background-color: rgba(__BG_RGB__, 0.75);
+}
+
+.panel {
+  background-color: rgba(__PANEL_RGB__, 0.92);
+  border-radius: 18px;
+  padding: 20px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+}
+
+/* Input: deliberately much larger than the result rows. */
+entry.search {
+  font-size: __ENTRY_SIZE__px;
+  font-weight: 400;
+  color: __FOREGROUND__;
+  caret-color: __ACCENT__;
+  background: none;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+  min-height: 0;
+  padding: 6px 12px 10px 12px;
+  /* The only thing separating the input from the results is space. */
+  margin-bottom: 30px;
+}
+
+entry.search text {
+  background: transparent;
+  color: __FOREGROUND__;
+}
+
+entry.search text selection {
+  background-color: __SELECTION__;
+  color: __FOREGROUND__;
+}
+
+entry.search > text > placeholder {
+  color: __MUTED__;
+  opacity: 1;
+}
+
+/* Results: no frames, no separators — spacing only. */
+list.results,
+list.results > row {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+list.results > row.result {
+  padding: 9px 12px;
+  margin: 2px 0;
+  border-radius: 12px;
+  transition: background-color 90ms ease-out;
+}
+
+list.results > row.result:hover {
+  background-color: rgba(__SELECTION_RGB__, 0.45);
+}
+
+list.results > row.result:selected {
+  background-color: __SELECTION__;
+}
+
+.name {
+  font-size: __NAME_SIZE__px;
+  color: __FOREGROUND__;
+}
+
+list.results > row.result:selected .name {
+  color: __ACCENT__;
+}

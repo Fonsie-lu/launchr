@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GTK4
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev
+
+      # gtk4-layer-shell is only packaged from Ubuntu 24.10 on, so fall back to
+      # building it when apt cannot supply it.
+      - name: Install gtk4-layer-shell
+        run: |
+          if ! sudo apt-get install -y libgtk4-layer-shell-dev; then
+            sudo apt-get install -y meson ninja-build libwayland-dev wayland-protocols gobject-introspection libgirepository1.0-dev valac
+            git clone --depth 1 --branch v1.0.2 https://github.com/wmww/gtk4-layer-shell.git
+            meson setup -Dexamples=false -Ddocs=false -Dtests=false --prefix=/usr gtk4-layer-shell/build gtk4-layer-shell
+            ninja -C gtk4-layer-shell/build
+            sudo ninja -C gtk4-layer-shell/build install
+            sudo ldconfig
+          fi
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked

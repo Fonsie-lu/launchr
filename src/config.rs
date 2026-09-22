@@ -7,7 +7,7 @@
 //! with a warning on stderr rather than rejecting the whole file.
 
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
 pub struct Colors {
@@ -97,6 +97,13 @@ struct FileConfig {
     appimages: Vec<FileAppImage>,
 }
 
+/// Accepted ranges, shared with `parse_args` in `main.rs` so a value set in
+/// the file and the same value set by a flag are clamped identically.
+pub const FONT_SIZE: std::ops::RangeInclusive<u32> = 8..=60;
+pub const LINES: std::ops::RangeInclusive<usize> = 1..=50;
+pub const DIM: std::ops::RangeInclusive<f64> = 0.0..=1.0;
+pub const MAX_BLUR: u32 = 200;
+
 fn config_path() -> Option<PathBuf> {
     let xdg = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -140,8 +147,16 @@ fn valid_hex(value: String, field: &str) -> Option<String> {
 }
 
 pub fn load() -> FileOverrides {
-    let Some(path) = config_path() else { return FileOverrides::default() };
-    let text = match std::fs::read_to_string(&path) {
+    match config_path() {
+        Some(path) => load_from(&path),
+        None => FileOverrides::default(),
+    }
+}
+
+/// The body of [`load`], split out so the tests can point it at a file of
+/// their own instead of the caller's home directory.
+fn load_from(path: &Path) -> FileOverrides {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return FileOverrides::default(),
         Err(err) => {
@@ -181,10 +196,10 @@ pub fn load() -> FileOverrides {
 
     FileOverrides {
         colors,
-        font_size: file.font_size.map(|v| v.clamp(8, 60)),
-        lines: file.lines.map(|v| v.clamp(1, 50)),
-        dim: file.dim.map(|v| v.clamp(0.0, 1.0)),
-        blur: file.blur.map(|v| v.min(200)),
+        font_size: file.font_size.map(|v| v.clamp(*FONT_SIZE.start(), *FONT_SIZE.end())),
+        lines: file.lines.map(|v| v.clamp(*LINES.start(), *LINES.end())),
+        dim: file.dim.map(|v| v.clamp(*DIM.start(), *DIM.end())),
+        blur: file.blur.map(|v| v.min(MAX_BLUR)),
         appimages,
     }
 }
@@ -214,6 +229,53 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_file_is_not_an_error() {
+        let overrides = load_from(Path::new("/nonexistent/launchr.json"));
+        assert!(overrides.appimages.is_empty());
+        assert_eq!(overrides.lines, None);
+        assert_eq!(overrides.colors.accent, Colors::default().accent);
+    }
+
+    fn write_file(name: &str, extension: &str, body: &str) -> PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("launchr-config-{name}-{}.{extension}", std::process::id()));
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn write_config(name: &str, body: &str) -> PathBuf {
+        write_file(name, "json", body)
+    }
+
+    #[test]
+    fn unparsable_json_falls_back_to_the_defaults() {
+        let path = write_config("broken", "{ not json");
+        let overrides = load_from(&path);
+        // Removed before the assertions so a failure does not leak the file.
+        std::fs::remove_file(&path).ok();
+        assert_eq!(overrides.font_size, None);
+        assert_eq!(overrides.colors.background, Colors::default().background);
+    }
+
+    #[test]
+    fn file_values_are_read_and_clamped() {
+        let path = write_config(
+            "clamped",
+            r##"{ "font_size": 400, "lines": 0, "dim": -1, "blur": 9000,
+                  "colors": { "accent": "#ff0000", "muted": "not a color" } }"##,
+        );
+        let overrides = load_from(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(overrides.font_size, Some(60));
+        assert_eq!(overrides.lines, Some(1));
+        assert_eq!(overrides.dim, Some(0.0));
+        assert_eq!(overrides.blur, Some(200));
+        assert_eq!(overrides.colors.accent, "#ff0000");
+        // One bad field is skipped; the rest of the file still applies.
+        assert_eq!(overrides.colors.muted, Colors::default().muted);
+    }
+
+    #[test]
     fn appimage_entry_needs_a_real_file() {
         let missing = FileAppImage {
             name: "Ghost".to_owned(),
@@ -222,12 +284,10 @@ mod tests {
         };
         assert!(missing.into_config().is_none());
 
-        let dir = std::env::temp_dir();
-        let path = dir.join("launchr-config-test.AppImage");
-        std::fs::write(&path, b"").unwrap();
+        let path = write_file("appimage", "AppImage", "");
         let real = FileAppImage { name: "Real".to_owned(), path: path.display().to_string(), icon: None };
         let config = real.into_config().expect("existing file should be accepted");
-        assert_eq!(config.name, "Real");
         std::fs::remove_file(&path).ok();
+        assert_eq!(config.name, "Real");
     }
 }

@@ -45,11 +45,6 @@ The binary is dynamically linked, so GTK4 and `gtk4-layer-shell` still have to b
 the runtime libraries only, not the `-dev`/`-devel` packages. On a musl distro, or for anything
 other than x86_64, build from source instead.
 
-There is also a `launchr` binary checked in at the root of this repository, same build for the
-same target. It is committed by hand, so unlike the release assets it is only as new as whoever
-last remembered to rebuild it — check its date against the commits touching `src/` before
-trusting it, or just build from source, which takes seconds.
-
 ## Build and install
 
 ```bash
@@ -205,17 +200,26 @@ things it never uses. Each one gives way to an explicit setting in the environme
 ```
 $ LAUNCHR_TIMING=1 launchr -b
 launchr:     0.0ms  main
-launchr:    20.4ms  captured
-launchr:    22.6ms  gtk init
-launchr:    25.6ms  blurred
-launchr:    45.7ms  css loaded
-launchr:    49.4ms  items loaded
-launchr:    57.9ms  first frame
+launchr:    15.2ms  gtk init
+launchr:    48.6ms  captured
+launchr:    63.3ms  blurred
+launchr:    71.4ms  css loaded
+launchr:    78.0ms  items loaded
+launchr:    78.1ms  backdrop collected
+launchr:    83.3ms  rows filled
+launchr:   118.7ms  first frame
 ```
 
-That is a 2560x1440 output on a Ryzen 7 7800X3D; without `-b` the same machine reaches the
-first frame in 39ms. What is left is nearly all GTK — opening the display and initialising the
-style cascade — so if a machine is slower than this, that is the place to look first.
+The backdrop is collected after the item list is built rather than before, so `AppInfo::all()`
+— which reparses every desktop file, and is the most expensive thing left on the main thread —
+overlaps the capture instead of queueing behind it. Neither wait is unbounded: every compositor
+exchange after the registry is up runs on a 300ms deadline, and the main thread gives the whole
+worker 900ms before it settles for a dim-only window.
+
+What is left is nearly all GTK — opening the display, initialising the style cascade and
+mapping the surface — so if a machine is slower than this, that is the place to look first.
+Numbers above are a 2560x1440 output on a Ryzen 5 5600; without `-b` the same machine reaches
+the first frame in about 110ms.
 
 ## Where the data lives
 
@@ -226,8 +230,9 @@ count	last_used_unix	desktop_id
 ```
 
 Delete the file to reset the ranking, or edit it to pin something to the top. Unparsable lines
-are skipped rather than fatal, and writes go through a temp file + rename so an interrupted
-launch cannot truncate the store.
+are skipped rather than fatal, and writes go through a temp file that is flushed to disk before
+being renamed into place, so neither an interrupted launch nor a power cut can truncate the
+store.
 
 ## Layout
 

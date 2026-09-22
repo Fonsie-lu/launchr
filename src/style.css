@@ -9,9 +9,9 @@ window.launchr {
 }
 
 /* Fullscreen scrim, painted over the blurred screenshot the launcher takes of
-   the output itself. Alpha is overridden at runtime by --dim / "dim". */
+   the output itself. The alpha comes from --dim / "dim" (default 0.75). */
 .dim {
-  background-color: rgba(__BG_RGB__, 0.75);
+  background-color: rgba(__BG_RGB__, __DIM__);
 }
 
 .panel {

@@ -4,7 +4,9 @@
 //! `count \t last_used_unix \t desktop_id`
 
 use std::collections::HashMap;
-use std::fs;
+use std::fmt::Write as _;
+use std::fs::{self, File};
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -65,13 +67,33 @@ impl Usage {
         rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(b.0)));
         let mut out = String::new();
         for (id, (count, last)) in rows {
-            out.push_str(&format!("{count}\t{last}\t{id}\n"));
+            let _ = writeln!(out, "{count}\t{last}\t{id}");
         }
 
-        // Write through a temp file so a crash cannot truncate the store.
+        // Write through a temp file so a crash cannot truncate the store. The
+        // rename is atomic, but it says nothing about the bytes having reached
+        // the disk, so flush them first — otherwise a power cut between write
+        // and rename can leave an empty usage.tsv where the store used to be.
+        // The directory entry the rename creates needs the same treatment, or
+        // the rename itself is what a power cut loses.
+        //
+        // Both flushes cost real time on a busy disk. `activate` closes the
+        // window before it gets here, so they delay the launcher's own exit
+        // rather than the application it just started.
         let tmp = path.with_extension("tmp");
-        if fs::write(&tmp, out).is_ok() {
-            let _ = fs::rename(&tmp, path);
+        let written = File::create(&tmp).and_then(|mut file| {
+            file.write_all(out.as_bytes())?;
+            file.sync_all()
+        });
+        if written.is_err() {
+            let _ = fs::remove_file(&tmp);
+            return;
+        }
+        if fs::rename(&tmp, path).is_err() {
+            return;
+        }
+        if let Ok(handle) = File::open(dir) {
+            let _ = handle.sync_all();
         }
     }
 }

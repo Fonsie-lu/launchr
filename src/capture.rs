@@ -5,13 +5,15 @@
 //! wlroots-based. Capturing happens before the window is mapped, so the
 //! snapshot never contains the launcher itself.
 
+use rustix::event::{PollFd, PollFlags, Timespec};
 use std::fs::File;
 use std::ops::Deref;
 use std::os::fd::{AsFd, OwnedFd};
 use std::ptr::NonNull;
+use std::time::{Duration, Instant};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool};
-use wayland_client::{delegate_noop, Connection, Dispatch, Proxy, QueueHandle, WEnum};
+use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
@@ -101,10 +103,15 @@ impl Drop for Mapping {
     }
 }
 
-/// Capture every output. Returns an empty vec when the compositor does not
-/// implement screencopy — the caller then falls back to dimming only.
-pub fn capture_outputs() -> Vec<Frame> {
-    match try_capture() {
+/// Capture every output, giving up at `deadline`. Returns an empty vec when
+/// the compositor does not implement screencopy, or does not answer in time —
+/// the caller then falls back to dimming only.
+///
+/// `deadline` covers every compositor exchange after the registry is up. The
+/// round trip inside `registry_queue_init` cannot be given a timeout, so it
+/// sits outside; the caller's own wait is what bounds that one.
+pub fn capture_outputs(deadline: Instant) -> Vec<Frame> {
+    match try_capture(deadline) {
         Ok(frames) => frames,
         Err(error) => {
             eprintln!("launchr: screen capture unavailable ({error}), falling back to dim only");
@@ -113,7 +120,7 @@ pub fn capture_outputs() -> Vec<Frame> {
     }
 }
 
-fn try_capture() -> Result<Vec<Frame>, String> {
+fn try_capture(deadline: Instant) -> Result<Vec<Frame>, String> {
     let connection = Connection::connect_to_env().map_err(|e| e.to_string())?;
     let (globals, mut queue) =
         registry_queue_init::<State>(&connection).map_err(|e| e.to_string())?;
@@ -138,26 +145,27 @@ fn try_capture() -> Result<Vec<Frame>, String> {
     if state.outputs.is_empty() {
         return Err("no outputs".to_owned());
     }
-    // Connector names only matter when there is more than one shot to pair
-    // with a monitor, and the round trip that delivers them is a full
-    // compositor turnaround, so a single output skips it.
-    if state.outputs.len() > 1 {
-        queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
-    }
-
+    // Requested before anything is waited on: the copies need only the output
+    // proxies, so putting the framebuffer readback in flight first lets the
+    // connector names arrive alongside it rather than one round trip ahead.
     for index in 0..state.outputs.len() {
         manager.capture_output(0, &state.outputs[index].proxy, &qh, index);
         state.slots.push(Slot::default());
         state.pending += 1;
     }
 
-    // Bounded so a compositor that never answers cannot hang the launcher.
-    for _ in 0..200 {
-        if state.pending == 0 {
-            break;
-        }
-        queue.blocking_dispatch(&mut state).map_err(|e| e.to_string())?;
-    }
+    // Bounded in wall clock, not in iterations: neither `blocking_dispatch` nor
+    // `roundtrip` takes a timeout, so a compositor that goes quiet would
+    // otherwise hang the launcher here forever.
+    //
+    // Connector names only matter when there is more than one shot to pair with
+    // a monitor; with one output there is nothing to pair and the wait ends as
+    // soon as the frame lands.
+    let want_names = state.outputs.len() > 1;
+    wait_until(&mut queue, &mut state, deadline, "the compositor", |state| {
+        state.pending == 0
+            && (!want_names || state.outputs.iter().all(|o| o.connector.is_some()))
+    })?;
 
     let mut frames = Vec::new();
     for (index, slot) in state.slots.iter().enumerate() {
@@ -177,6 +185,61 @@ fn try_capture() -> Result<Vec<Frame>, String> {
         });
     }
     Ok(frames)
+}
+
+/// Dispatch events until `done`, or until `deadline` passes. Giving up is not
+/// an error: the caller keeps whatever did arrive.
+fn wait_until(
+    queue: &mut EventQueue<State>,
+    state: &mut State,
+    deadline: Instant,
+    waiting_for: &str,
+    done: impl Fn(&State) -> bool,
+) -> Result<(), String> {
+    while !done(state) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || !dispatch_before(queue, state, left)? {
+            eprintln!("launchr: screen capture timed out waiting for {waiting_for}");
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// One dispatch pass that gives up after `timeout` instead of blocking for as
+/// long as the compositor feels like. Returns `false` when the pass made no
+/// progress, which the caller treats as "stop waiting".
+fn dispatch_before(
+    queue: &mut EventQueue<State>,
+    state: &mut State,
+    timeout: Duration,
+) -> Result<bool, String> {
+    if queue.dispatch_pending(state).map_err(|e| e.to_string())? > 0 {
+        return Ok(true);
+    }
+    queue.flush().map_err(|e| e.to_string())?;
+    // `None` means "dispatch before asking again" — but the dispatch above
+    // already came up empty this pass, so one more attempt decides it. Saying
+    // "keep going" unconditionally here would spin on the CPU for the whole
+    // deadline without ever reaching the poll below.
+    let Some(guard) = queue.prepare_read() else {
+        return Ok(queue.dispatch_pending(state).map_err(|e| e.to_string())? > 0);
+    };
+
+    let timeout = Timespec::try_from(timeout).map_err(|e| e.to_string())?;
+    // Scoped so the borrow of `guard` ends before `guard.read()` consumes it.
+    let ready = {
+        let fd = guard.connection_fd();
+        let mut fds = [PollFd::new(&fd, PollFlags::IN | PollFlags::ERR)];
+        rustix::io::retry_on_intr(|| rustix::event::poll(&mut fds, Some(&timeout)))
+            .map_err(|e| e.to_string())?
+    };
+    if ready == 0 {
+        return Ok(false);
+    }
+    guard.read().map_err(|e| e.to_string())?;
+    queue.dispatch_pending(state).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 /// Byte offsets of R, G and B inside a 32 bit pixel of the given format.

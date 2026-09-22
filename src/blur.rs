@@ -38,10 +38,11 @@ fn scale_factor(width: u32, height: u32) -> u32 {
     longest.div_ceil(WORKING_EDGE).max(1)
 }
 
-/// Average each `factor` x `factor` block down to one RGB pixel, sampling at
-/// most a 2x2 grid inside the block. Reading every source pixel is the single
-/// most expensive thing the launcher does on a slow CPU, and the difference
-/// never survives three box passes.
+/// Average each `factor` x `factor` block down to one RGB pixel, sampling
+/// every `max(factor / 2, 1)`-th pixel on both axes — a 2x2 grid inside the
+/// block for an even `factor`, 3x3 for an odd one. Reading every source pixel
+/// is the single most expensive thing the launcher does on a slow CPU, and the
+/// difference never survives three box passes.
 fn downscale(frame: &Frame, factor: u32) -> Option<Image> {
     let width = frame.width / factor;
     let height = frame.height / factor;

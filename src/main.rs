@@ -24,6 +24,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 use usage::Usage;
 
 const APP_ID: &str = "ch.bithawk.launchr";
@@ -32,6 +33,23 @@ const STYLE: &str = include_str!("style.css");
 
 /// Radius `-b` picks when it is given no number of its own.
 const DEFAULT_BLUR: u32 = 32;
+
+/// Shown for anything without an icon of its own.
+const FALLBACK_ICON: &str = "application-x-executable";
+
+/// How long the main thread waits on the capture worker before giving up and
+/// showing a dim-only window.
+///
+/// The single budget for the whole backdrop: the worker is handed a deadline
+/// derived from it rather than carrying a constant of its own, so there are
+/// never two numbers to keep in step.
+const BACKDROP_WAIT: Duration = Duration::from_millis(900);
+
+/// The share of `BACKDROP_WAIT` the compositor exchanges may spend. What is
+/// left pays for the downscale and the three blur passes, which run after the
+/// last frame arrives: there is no point capturing a frame the main thread
+/// will have given up on by the time it has been blurred.
+const CAPTURE_SHARE: u32 = 3;
 
 /// Wall clock since process start, printed only with LAUNCHR_TIMING=1 in the
 /// environment. Startup latency is the whole point of a launcher, so the
@@ -50,8 +68,9 @@ mod timing {
 
     pub fn mark(label: &str) {
         if *ON.get_or_init(|| false) {
-            let elapsed = START.get_or_init(Instant::now).elapsed();
-            eprintln!("launchr: {:>7.1}ms  {label}", elapsed.as_secs_f64() * 1000.0);
+            if let Some(start) = START.get() {
+                eprintln!("launchr: {:7.1}ms  {label}", start.elapsed().as_secs_f64() * 1000.0);
+            }
         }
     }
 }
@@ -117,27 +136,47 @@ impl Config {
     }
 }
 
-/// What activating an `Item` actually launches.
+/// What activating an entry actually launches. Held in a vec parallel to
+/// `State::entries` so the ranking never has to touch a GTK type.
 #[derive(Clone)]
 enum Target {
     Desktop(gio::AppInfo),
     AppImage(AppImageConfig),
 }
 
-/// One launchable entry plus the precomputed text we match against.
-struct Item {
-    target: Target,
+/// One searchable field of an entry and how much a hit in it counts.
+struct Field {
+    folded: matcher::Folded,
+    weight: f32,
+}
+
+fn field(raw: &str, weight: f32) -> Field {
+    Field { folded: matcher::Folded::new(raw), weight }
+}
+
+/// Everything the ranking needs about one launchable entry. Deliberately free
+/// of GTK and GIO types so `rank` can be unit tested.
+struct Entry {
     id: String,
+    /// As displayed, with its original case and accents.
     name: String,
-    /// Lowercased searchable text with a per-field weight.
-    fields: Vec<(String, f32)>,
+    /// The name is always the first field, at full weight.
+    fields: Vec<Field>,
     count: u32,
     last_used: u64,
 }
 
+impl Entry {
+    /// Folded name, which is what keeps the list in alphabetical order.
+    fn sort_key(&self) -> &str {
+        &self.fields[0].folded.text
+    }
+}
+
 struct State {
-    items: Vec<Item>,
-    /// Indices into `items`, in the order currently displayed.
+    entries: Vec<Entry>,
+    targets: Vec<Target>,
+    /// Indices into `entries`, in the order currently displayed.
     shown: Vec<usize>,
     usage: Usage,
     launch_env: LaunchEnv,
@@ -158,46 +197,14 @@ type Selected = Rc<Cell<usize>>;
 fn main() -> glib::ExitCode {
     timing::init();
     timing::mark("main");
-    let config = match parse_args(Config::default().with_file_overrides()) {
-        Ok(Some(config)) => config,
-        Ok(None) => return glib::ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("launchr: {message}");
-            return glib::ExitCode::FAILURE;
-        }
-    };
 
-    // Reading the desktop files is a few hundred small reads that never touch
-    // GTK, so it runs alongside bringing the toolkit up.
-    let scan_job = std::thread::spawn(scan_desktop_files);
-
-    // Grab the backdrop before GTK maps anything, otherwise the launcher ends
-    // up in its own screenshot. Capture talks to the compositor over its own
-    // Wayland connection and the blur is pure CPU work, so both go on a worker
-    // thread as well; the pixels are collected again before the window is
-    // presented, which is the point the ordering actually has to hold.
-    let blur_radius = config.blur;
-    let capture_job = (blur_radius > 0).then(|| {
-        std::thread::spawn(move || {
-            let frames = capture::capture_outputs();
-            timing::mark("captured");
-            let images: Vec<_> = frames
-                .iter()
-                .filter_map(|frame| {
-                    Some((frame.connector.clone(), blur::blurred(frame, blur_radius)?))
-                })
-                .collect();
-            timing::mark("blurred");
-            images
-        })
-    });
-
-    // A plain gtk::init beats gtk::Application here: GApplication registers
-    // itself on the session bus before it will emit `activate`, and that
-    // round trip costs more than everything this launcher does with GTK.
-    glib::set_prgname(Some(APP_ID));
-    glib::set_application_name("launchr");
-    gdk::set_allowed_backends("wayland");
+    // Both overrides happen here, before a single thread exists, and not down
+    // beside `gtk::init` where they belong logically. glibc's `setenv` can
+    // reallocate `environ`, and both workers below read the environment — the
+    // scan for XDG_DATA_HOME/XDG_DATA_DIRS, the capture for WAYLAND_DISPLAY —
+    // so writing to it once they are running is a data race, not a tidiness
+    // question.
+    //
     // GL/Vulkan context creation dominates the first frame of a process that
     // only lives for a few seconds; the cairo renderer draws this UI just as
     // well and starts sooner. An explicit GSK_RENDERER still wins. These two
@@ -216,6 +223,59 @@ fn main() -> glib::ExitCode {
     if original_gtk_theme.is_none() {
         std::env::set_var("GTK_THEME", "Adwaita");
     }
+
+    let config = match parse_args(Config::default().with_file_overrides(), std::env::args().skip(1))
+    {
+        Ok(Some(config)) => config,
+        Ok(None) => return glib::ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("launchr: {message}");
+            return glib::ExitCode::FAILURE;
+        }
+    };
+
+    // Reading the desktop files is a few hundred small reads that never touch
+    // GTK, so it runs alongside bringing the toolkit up. Spawned once the
+    // arguments are known to be good: `--help` and a rejected flag return
+    // before any window exists, and should not pay for a scan nobody reads.
+    let scan_job = std::thread::spawn(scan_desktop_files);
+
+    // Grab the backdrop before GTK maps anything, otherwise the launcher ends
+    // up in its own screenshot. Capture talks to the compositor over its own
+    // Wayland connection and the blur is pure CPU work, so both go on a worker
+    // thread as well; the pixels are collected again before the window is
+    // presented, which is the point the ordering actually has to hold. The
+    // result comes back over a channel rather than a join so the wait can time
+    // out — see `BACKDROP_WAIT`.
+    let blur_radius = config.blur;
+    let capture_job = (blur_radius > 0).then(|| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let deadline = std::time::Instant::now() + BACKDROP_WAIT / CAPTURE_SHARE;
+        std::thread::spawn(move || {
+            let frames = capture::capture_outputs(deadline);
+            timing::mark("captured");
+            // Sequential across outputs. Blurring them in parallel would need
+            // `Mapping` to claim `Sync`, and a hand-written unsafe impl on the
+            // mmap wrapper is not worth the few ms it would save on the second
+            // monitor.
+            let images: Vec<_> = frames
+                .iter()
+                .filter_map(|frame| {
+                    Some((frame.connector.clone(), blur::blurred(frame, blur_radius)?))
+                })
+                .collect();
+            timing::mark("blurred");
+            let _ = sender.send(images);
+        });
+        receiver
+    });
+
+    // A plain gtk::init beats gtk::Application here: GApplication registers
+    // itself on the session bus before it will emit `activate`, and that
+    // round trip costs more than everything this launcher does with GTK.
+    glib::set_prgname(Some(APP_ID));
+    glib::set_application_name("launchr");
+    gdk::set_allowed_backends("wayland");
     if gtk::init().is_err() {
         eprintln!("launchr: cannot open a display");
         return glib::ExitCode::FAILURE;
@@ -225,9 +285,27 @@ fn main() -> glib::ExitCode {
     load_css(&config.colors, config.font_size, config.dim);
     timing::mark("css loaded");
 
-    let backdrops = capture_job.map_or_else(Vec::new, |job| {
-        let images = job.join().unwrap_or_default();
-        timing::mark("capture joined");
+    // Building the item list runs before the backdrop is collected rather than
+    // after, so `AppInfo::all()` — which reparses every desktop file the scan
+    // thread already read, and is the most expensive thing left on the main
+    // thread — overlaps the capture instead of queueing behind it.
+    let usage = Usage::load();
+    timing::mark("usage loaded");
+    // `panic = "abort"` is set for the release profile only, so this fallback
+    // is unreachable there but live in dev and test builds — where losing the
+    // two extra searchable keys beats taking the launcher down with the
+    // worker.
+    let extras = scan_job.join().unwrap_or_default();
+    timing::mark("desktop files scanned");
+    let (entries, targets) = load_items(&usage, &extras, &config.appimages);
+    timing::mark("items loaded");
+
+    let backdrops = capture_job.map_or_else(Vec::new, |receiver| {
+        let images = receiver.recv_timeout(BACKDROP_WAIT).unwrap_or_else(|_| {
+            eprintln!("launchr: backdrop was not ready in time, dimming only");
+            Vec::new()
+        });
+        timing::mark("backdrop collected");
         let out: Vec<Backdrop> = images
             .iter()
             .map(|(connector, image)| Backdrop {
@@ -239,31 +317,43 @@ fn main() -> glib::ExitCode {
         out
     });
 
-    let extras = scan_job.join().unwrap_or_default();
-    timing::mark("desktop files scanned");
-
     let main_loop = glib::MainLoop::new(None, false);
     build_ui(
         &main_loop,
         &Rc::new(config),
         &Rc::new(backdrops),
-        extras,
-        LaunchEnv { original_gsk_renderer, original_gtk_theme },
+        State {
+            entries,
+            targets,
+            shown: Vec::new(),
+            usage,
+            launch_env: LaunchEnv { original_gsk_renderer, original_gtk_theme },
+        },
     );
     main_loop.run();
     timing::mark("exit");
     glib::ExitCode::SUCCESS
 }
 
+fn flag_value(flag: &str, next: Option<String>) -> Result<String, String> {
+    next.ok_or_else(|| format!("{flag} needs a value"))
+}
+
+fn flag_number<T: std::str::FromStr>(flag: &str, next: Option<String>) -> Result<T, String> {
+    flag_value(flag, next)?
+        .parse()
+        .map_err(|_| format!("{flag} expects a number"))
+}
+
 /// `base` is the built-in defaults with `~/.config/launchr.json` already
 /// applied; any flag here overrides it further.
-fn parse_args(base: Config) -> Result<Option<Config>, String> {
+fn parse_args<I>(base: Config, args: I) -> Result<Option<Config>, String>
+where
+    I: IntoIterator<Item = String>,
+{
     let mut config = base;
-    let mut args = std::env::args().skip(1).peekable();
+    let mut args = args.into_iter().peekable();
     while let Some(arg) = args.next() {
-        // `-b` is the one option whose value is optional, so the value is
-        // pulled out here rather than through a closure over the iterator.
-        let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
         match arg.as_str() {
             "-h" | "--help" => {
                 println!(
@@ -287,17 +377,15 @@ fn parse_args(base: Config) -> Result<Option<Config>, String> {
                 return Ok(None);
             }
             "-l" | "--lines" => {
-                config.lines = value()?.parse().map_err(|_| "--lines expects a number")?;
-                config.lines = config.lines.clamp(1, 50);
+                let lines = flag_number::<usize>(&arg, args.next())?;
+                config.lines = lines.clamp(*config::LINES.start(), *config::LINES.end());
             }
             "-w" | "--width" => {
-                config.width = value()?.parse().map_err(|_| "--width expects a number")?;
-                config.width = config.width.clamp(240, 3000);
+                config.width = flag_number::<i32>(&arg, args.next())?.clamp(240, 3000);
             }
-            "-p" | "--prompt" => config.placeholder = value()?,
-            "-q" | "--query" => config.query = value()?,
+            "-p" | "--prompt" => config.placeholder = flag_value(&arg, args.next())?,
+            "-q" | "--query" => config.query = flag_value(&arg, args.next())?,
             "-b" | "--blur" => {
-                drop(value);
                 // A bare -b means "blur, you pick the radius"; a number after
                 // it sets one. Anything else is the next option, left alone.
                 let radius = match args.peek().and_then(|next| next.parse::<u32>().ok()) {
@@ -307,12 +395,18 @@ fn parse_args(base: Config) -> Result<Option<Config>, String> {
                     }
                     None => DEFAULT_BLUR,
                 };
-                config.blur = radius.min(200);
+                config.blur = radius.min(config::MAX_BLUR);
             }
             "--no-blur" => config.blur = 0,
             "-d" | "--dim" => {
-                config.dim = value()?.parse().map_err(|_| "--dim expects a number")?;
-                config.dim = config.dim.clamp(0.0, 1.0);
+                // `"nan".parse::<f64>()` succeeds and `f64::clamp` hands NaN
+                // straight back, which would reach the stylesheet as
+                // `rgba(r, g, b, NaN)` and take the whole scrim out with it.
+                let dim = flag_number::<f64>(&arg, args.next())?;
+                if !dim.is_finite() {
+                    return Err(format!("{arg} expects a number"));
+                }
+                config.dim = dim.clamp(*config::DIM.start(), *config::DIM.end());
             }
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -339,7 +433,7 @@ fn texture(image: &blur::Image) -> gdk::MemoryTexture {
 /// Fills in `style.css`'s color and size placeholders. Plain string
 /// substitution rather than GTK's `@define-color` cascade, so the result is
 /// ordinary CSS regardless of provider load order.
-fn render_style(colors: &Colors, font_size: u32) -> String {
+fn render_style(colors: &Colors, font_size: u32, dim: f64) -> String {
     // Keeps the original theme's ratio between the search entry and a result
     // row's name (39px / 21px) at any font size.
     let entry_size = font_size + 18;
@@ -353,6 +447,7 @@ fn render_style(colors: &Colors, font_size: u32) -> String {
         .replace("__MUTED__", &colors.muted)
         .replace("__ENTRY_SIZE__", &entry_size.to_string())
         .replace("__NAME_SIZE__", &font_size.to_string())
+        .replace("__DIM__", &dim.to_string())
 }
 
 fn load_css(colors: &Colors, font_size: u32, dim: f64) {
@@ -360,18 +455,56 @@ fn load_css(colors: &Colors, font_size: u32, dim: f64) {
     // Above PRIORITY_USER, not PRIORITY_APPLICATION: a user GTK theme in
     // ~/.config/gtk-4.0/gtk.css sits at 800 and would otherwise repaint the
     // list and its selection in the theme's own colours.
-    let base = gtk::STYLE_PROVIDER_PRIORITY_USER + 1;
-    let bg_rgb = config::rgb_triplet(&colors.background);
-    for (css, priority) in [
-        (render_style(colors, font_size), base),
-        (
-            format!(".dim {{ background-color: rgba({bg_rgb}, {dim}); }}"),
-            base + 1,
-        ),
-    ] {
-        let provider = gtk::CssProvider::new();
-        provider.load_from_string(&css);
-        gtk::style_context_add_provider_for_display(&display, &provider, priority);
+    //
+    // One provider, not two: the dim used to arrive as a second provider
+    // layered on top, and every provider added to a display invalidates the
+    // whole style cascade again. It is a token in the template instead.
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(&render_style(colors, font_size, dim));
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_USER + 1,
+    );
+}
+
+/// One result row. The widgets are built once and refilled as the query
+/// changes, so a keystroke costs a label and an icon update instead of tearing
+/// down and rebuilding the whole list.
+struct Row {
+    row: gtk::ListBoxRow,
+    icon: gtk::Image,
+    name: gtk::Label,
+    /// Index into `State::entries` currently displayed. Entry indices are
+    /// fixed for the life of the process, so this is enough to skip a refill —
+    /// and the icon lookup inside it — for a row a keystroke did not move.
+    shown: Cell<Option<usize>>,
+}
+
+impl Row {
+    /// Display `entry`. Nothing outside these two methods touches `shown`, so
+    /// it cannot drift out of step with what the widgets are holding.
+    fn show(&self, index: usize, entry: &Entry, target: &Target) {
+        // Narrowing a query usually leaves the top rows where they were, and
+        // the icon lookup below is the expensive half of this method.
+        if self.shown.replace(Some(index)) != Some(index) {
+            self.name.set_label(&entry.name);
+            match target {
+                Target::Desktop(info) => match info.icon() {
+                    Some(gicon) => self.icon.set_from_gicon(&gicon),
+                    None => self.icon.set_icon_name(Some(FALLBACK_ICON)),
+                },
+                Target::AppImage(app) => {
+                    self.icon.set_icon_name(Some(app.icon.as_deref().unwrap_or(FALLBACK_ICON)))
+                }
+            }
+        }
+        self.row.set_visible(true);
+    }
+
+    fn hide(&self) {
+        self.shown.set(None);
+        self.row.set_visible(false);
     }
 }
 
@@ -379,19 +512,9 @@ fn build_ui(
     main_loop: &glib::MainLoop,
     config: &Rc<Config>,
     backdrops: &Rc<Vec<Backdrop>>,
-    extras: HashMap<String, Extra>,
-    launch_env: LaunchEnv,
+    state: State,
 ) {
-    let usage = Usage::load();
-    timing::mark("usage loaded");
-    let items = load_items(&usage, &extras, &config.appimages);
-    timing::mark("items loaded");
-    let state = Rc::new(RefCell::new(State {
-        items,
-        shown: Vec::new(),
-        usage,
-        launch_env,
-    }));
+    let state = Rc::new(RefCell::new(state));
     let selected: Selected = Rc::new(Cell::new(0));
 
     let window = gtk::Window::builder().css_classes(["launchr"]).build();
@@ -418,6 +541,7 @@ fn build_ui(
 
     let entry = gtk::Entry::builder()
         .placeholder_text(&config.placeholder)
+        .text(&config.query)
         .css_classes(["search"])
         .has_frame(false)
         .hexpand(true)
@@ -429,6 +553,7 @@ fn build_ui(
         .show_separators(false)
         .activate_on_single_click(true)
         .build();
+    let rows = Rc::new(build_rows(&list, config.lines));
 
     let panel = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -465,29 +590,29 @@ fn build_ui(
         let backdrops = backdrops.clone();
         let backdrop = backdrop.clone();
         move |window| {
-            if backdrops.len() < 2 {
+            // A single output skips the round trip that delivers connector
+            // names, so unnamed shots are the one case where whatever was
+            // captured is by definition the right one. Everything else has to
+            // be matched, including a lone shot left over from a multi-output
+            // capture where the other output failed.
+            if backdrops.iter().all(|b| b.connector.is_none()) {
                 return;
             }
             let Some(surface) = window.surface() else { return };
             let Some(monitor) = WidgetExt::display(window).monitor_at_surface(&surface) else {
                 return;
             };
-            let connector = monitor.connector();
-            let connector = connector.as_ref().map(|c| c.as_str());
-            if let Some(found) =
-                backdrops.iter().find(|b| b.connector.as_deref() == connector)
-            {
-                backdrop.set_paintable(Some(&found.texture));
+            // No name from GDK is not the same as no match: without one there
+            // is nothing to pair against, so leave the first shot in place
+            // rather than blanking a backdrop that may well be correct.
+            let Some(connector) = monitor.connector() else { return };
+            match backdrops.iter().find(|b| b.connector.as_deref() == Some(connector.as_str())) {
+                Some(found) => backdrop.set_paintable(Some(&found.texture)),
+                // This output is named and nothing was captured for it. No
+                // backdrop beats another monitor's desktop behind the panel.
+                None => backdrop.set_paintable(None::<&gdk::Texture>),
             }
         }
-    });
-
-    entry.connect_changed({
-        let state = state.clone();
-        let selected = selected.clone();
-        let list = list.clone();
-        let config = config.clone();
-        move |entry| refresh(&state, &selected, &list, &entry.text(), config.lines)
     });
 
     list.connect_row_selected({
@@ -539,6 +664,7 @@ fn build_ui(
         let state = state.clone();
         let selected = selected.clone();
         let list = list.clone();
+        let rows = rows.clone();
         let window = window.clone();
         move |_, key, _, modifier| {
             let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
@@ -547,12 +673,20 @@ fn build_ui(
                 gdk::Key::Return | gdk::Key::KP_Enter => {
                     activate(&state, selected.get(), &window);
                 }
-                gdk::Key::Down | gdk::Key::Tab => move_selection(&state, &selected, &list, 1),
-                gdk::Key::Up | gdk::Key::ISO_Left_Tab => move_selection(&state, &selected, &list, -1),
-                gdk::Key::n | gdk::Key::j if ctrl => move_selection(&state, &selected, &list, 1),
-                gdk::Key::p | gdk::Key::k if ctrl => move_selection(&state, &selected, &list, -1),
-                gdk::Key::Page_Down => move_selection(&state, &selected, &list, 5),
-                gdk::Key::Page_Up => move_selection(&state, &selected, &list, -5),
+                gdk::Key::Down | gdk::Key::Tab => {
+                    move_selection(&state, &selected, &list, &rows, 1)
+                }
+                gdk::Key::Up | gdk::Key::ISO_Left_Tab => {
+                    move_selection(&state, &selected, &list, &rows, -1)
+                }
+                gdk::Key::n | gdk::Key::j if ctrl => {
+                    move_selection(&state, &selected, &list, &rows, 1)
+                }
+                gdk::Key::p | gdk::Key::k if ctrl => {
+                    move_selection(&state, &selected, &list, &rows, -1)
+                }
+                gdk::Key::Page_Down => move_selection(&state, &selected, &list, &rows, 5),
+                gdk::Key::Page_Up => move_selection(&state, &selected, &list, &rows, -5),
                 _ => return glib::Propagation::Proceed,
             }
             glib::Propagation::Stop
@@ -560,15 +694,25 @@ fn build_ui(
     });
     window.add_controller(keys);
 
-    refresh(&state, &selected, &list, &config.query, config.lines);
+    // Fill the rows for the starting query before wiring up `changed`: the
+    // entry already carries `config.query`, so connecting first would have the
+    // signal repeat this same pass for nothing.
+    refresh(&state, &selected, &list, &rows, &config.query);
     timing::mark("rows filled");
+    entry.connect_changed({
+        let state = state.clone();
+        let selected = selected.clone();
+        let list = list.clone();
+        let rows = rows.clone();
+        move |entry| refresh(&state, &selected, &list, &rows, &entry.text())
+    });
 
     // Hold the height of a full result list whatever is actually in it, so
     // the panel keeps its size and the input stays put instead of drifting up
     // the screen as a query narrows things down. Measured from a real row so
     // it follows the stylesheet rather than a number repeated here.
-    if let Some(row) = list.row_at_index(0) {
-        let (_, natural, _, _) = row.measure(gtk::Orientation::Vertical, -1);
+    if let Some(first) = rows.first() {
+        let (_, natural, _, _) = first.row.measure(gtk::Orientation::Vertical, -1);
         if natural > 0 {
             list.set_height_request(natural * config.lines as i32);
         }
@@ -580,64 +724,87 @@ fn build_ui(
     window.present();
     timing::mark("presented");
     entry.grab_focus();
-    if !config.query.is_empty() {
-        entry.set_text(&config.query);
-        entry.set_position(-1);
-    }
+    entry.set_position(-1);
+}
+
+/// Build the fixed set of result rows and hand back the handles `refresh`
+/// writes into. Rows beyond the current result count are hidden rather than
+/// removed, which keeps a row's index and its position in `State::shown` the
+/// same number.
+fn build_rows(list: &gtk::ListBox, lines: usize) -> Vec<Row> {
+    (0..lines)
+        .map(|_| {
+            let icon = gtk::Image::new();
+            icon.set_pixel_size(40);
+            let name = label("name");
+
+            let body = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(14)
+                .css_classes(["row-body"])
+                .build();
+            body.append(&icon);
+            body.append(&name);
+
+            let row = gtk::ListBoxRow::builder().child(&body).css_classes(["result"]).build();
+            list.append(&row);
+            Row { row, icon, name, shown: Cell::new(None) }
+        })
+        .collect()
 }
 
 /// Collect every desktop entry the user is allowed to see, plus the
-/// configured AppImages.
-fn load_items(usage: &Usage, extras: &HashMap<String, Extra>, appimages: &[AppImageConfig]) -> Vec<Item> {
-    let mut items: Vec<Item> = gio::AppInfo::all()
+/// configured AppImages, as two index-aligned vecs.
+fn load_items(
+    usage: &Usage,
+    extras: &HashMap<String, Extra>,
+    appimages: &[AppImageConfig],
+) -> (Vec<Entry>, Vec<Target>) {
+    let mut items: Vec<(Entry, Target)> = gio::AppInfo::all()
         .into_iter()
         .filter(|info| info.should_show())
         .filter_map(|info| {
             let id = info.id()?.to_string();
             let name = info.name().to_string();
             let extra = extras.get(&id);
-            let generic = extra.and_then(|e| e.generic_name.clone());
-            let comment = info.description().map(|s| s.to_string()).filter(|s| !s.is_empty());
 
-            let mut fields = vec![(name.to_lowercase(), 1.0)];
-            if let Some(generic) = &generic {
-                fields.push((generic.to_lowercase(), 0.65));
+            let mut fields = vec![field(&name, 1.0)];
+            if let Some(generic) = extra.and_then(|e| e.generic_name.as_deref()) {
+                fields.push(field(generic, 0.65));
             }
             if let Some(exec) = info.executable().file_name() {
-                fields.push((exec.to_string_lossy().to_lowercase(), 0.6));
+                fields.push(field(&exec.to_string_lossy(), 0.6));
             }
             if let Some(keywords) = extra.map(|e| &e.keywords).filter(|k| !k.is_empty()) {
-                fields.push((keywords.to_lowercase(), 0.45));
+                fields.push(field(keywords, 0.45));
             }
-            if let Some(comment) = &comment {
-                fields.push((comment.to_lowercase(), 0.35));
+            if let Some(comment) = info.description().filter(|s| !s.is_empty()) {
+                fields.push(field(&comment, 0.35));
             }
 
             let (count, last_used) = usage.get(&id);
-            Some(Item { target: Target::Desktop(info), id, name, fields, count, last_used })
+            let entry = Entry { id, name, fields, count, last_used };
+            Some((entry, Target::Desktop(info)))
         })
         .collect();
 
     for appimage in appimages {
         let id = format!("appimage:{}", appimage.path.display());
         let name = appimage.name.clone();
-        let mut fields = vec![(name.to_lowercase(), 1.0)];
+        let mut fields = vec![field(&name, 1.0)];
         if let Some(stem) = appimage.path.file_stem().and_then(|s| s.to_str()) {
-            fields.push((stem.to_lowercase(), 0.6));
+            fields.push(field(stem, 0.6));
         }
         let (count, last_used) = usage.get(&id);
-        items.push(Item {
-            target: Target::AppImage(appimage.clone()),
-            id,
-            name,
-            fields,
-            count,
-            last_used,
-        });
+        let entry = Entry { id, name, fields, count, last_used };
+        items.push((entry, Target::AppImage(appimage.clone())));
     }
 
-    items.sort_by_key(|item| item.name.to_lowercase());
-    items
+    // Compare the folded names in place. `sort_by_key` would have called the
+    // key function once per comparison, not once per item, which made this a
+    // few tens of thousands of throwaway allocations on the startup path.
+    items.sort_by(|(a, _), (b, _)| a.sort_key().cmp(b.sort_key()));
+    items.into_iter().unzip()
 }
 
 #[derive(Default)]
@@ -692,13 +859,26 @@ fn collect_desktop_files(dir: &Path, prefix: &str, out: &mut HashMap<String, Ext
     }
 }
 
+/// Read the `[Desktop Entry]` group and stop. Everything after it is actions
+/// and other groups this does not search, and a desktop file is read here only
+/// to be reparsed by GIO a moment later, so the less of it that is touched the
+/// better.
 fn parse_desktop_file(path: &Path) -> Option<Extra> {
+    // One read and borrowed lines. A `BufReader` would allocate a `String` per
+    // line and an 8KiB buffer per file for no gain — these files are smaller
+    // than that buffer, so stopping early saves parsing, never a read. Failing
+    // the whole file on unreadable bytes is deliberate: a half-parsed entry
+    // would shadow a readable copy of the same id in a lower priority
+    // directory.
     let text = std::fs::read_to_string(path).ok()?;
     let mut extra = Extra::default();
     let mut in_entry = false;
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('[') {
+            if in_entry {
+                break;
+            }
             in_entry = line == "[Desktop Entry]";
             continue;
         }
@@ -715,69 +895,105 @@ fn parse_desktop_file(path: &Path) -> Option<Extra> {
     Some(extra)
 }
 
+/// Apply a field's weight to the score it produced.
+///
+/// Scaling cannot simply multiply: `score` goes negative for a poor match in a
+/// long field, and multiplying a negative by a weight below one makes it
+/// *larger*, so the comment (0.35) would outrank the keywords (0.45) exactly
+/// when both matched badly. Dividing on that side keeps a lower weight worth
+/// less whatever the sign.
+fn weigh(score: i32, weight: f32) -> i32 {
+    let score = score as f32;
+    (if score >= 0.0 { score * weight } else { score / weight }) as i32
+}
+
+/// Keep the `lines` best of `ranked` in order and drop the rest. Generic so
+/// each caller's comparison inlines — this runs over the whole entry list on
+/// the startup path, where a trait object's indirect call blocks that.
+fn take_top<F>(ranked: &mut Vec<(usize, i32)>, lines: usize, mut compare: F)
+where
+    F: FnMut(&(usize, i32), &(usize, i32)) -> std::cmp::Ordering,
+{
+    // Only `lines` rows are ever displayed, so pull them out with a partial
+    // sort and order those. On an empty query that is the difference between
+    // ordering six entries and ordering a few thousand.
+    if ranked.len() > lines {
+        ranked.select_nth_unstable_by(lines, &mut compare);
+        ranked.truncate(lines);
+    }
+    ranked.sort_by(compare);
+}
+
+/// Pick the entries to show for `query`, best first, at most `lines` of them.
+///
+/// GTK-free on purpose: this is the whole of the ranking policy and it is
+/// covered by the tests at the bottom of this file.
+fn rank(entries: &[Entry], query: &str, lines: usize) -> Vec<usize> {
+    let needle = matcher::Folded::new(query.trim());
+
+    // In both branches below `entries` is in folded-name order, so the index is
+    // the alphabetical tie break and no name has to be folded again here. It
+    // also makes each comparison a total order, which is what lets `take_top`
+    // produce a stable, deterministic list.
+    if needle.is_empty() {
+        let mut ranked: Vec<(usize, i32)> = (0..entries.len()).map(|i| (i, 0)).collect();
+        take_top(&mut ranked, lines, |&(ai, _), &(bi, _)| {
+            let (a, b) = (&entries[ai], &entries[bi]);
+            b.count
+                .cmp(&a.count)
+                .then_with(|| b.last_used.cmp(&a.last_used))
+                .then_with(|| ai.cmp(&bi))
+        });
+        return ranked.into_iter().map(|(i, _)| i).collect();
+    }
+
+    let mut ranked: Vec<(usize, i32)> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, entry)| {
+            let best = entry
+                .fields
+                .iter()
+                .filter_map(|f| matcher::score(&needle, &f.folded).map(|s| weigh(s, f.weight)))
+                .max()?;
+            Some((i, best + popularity_bonus(entry.count)))
+        })
+        .collect();
+    take_top(&mut ranked, lines, |&(ai, asc), &(bi, bsc)| {
+        let (a, b) = (&entries[ai], &entries[bi]);
+        bsc.cmp(&asc)
+            .then_with(|| b.count.cmp(&a.count))
+            .then_with(|| a.name.len().cmp(&b.name.len()))
+            .then_with(|| ai.cmp(&bi))
+    });
+    ranked.into_iter().map(|(i, _)| i).collect()
+}
+
 /// Rebuild the visible rows for `query`.
+/// `rows` was built with one row per displayable line, so it is the row count
+/// as well as the widgets — there is no separate `lines` to fall out of step
+/// with it.
 fn refresh(
     state: &Rc<RefCell<State>>,
     selected: &Selected,
     list: &gtk::ListBox,
+    rows: &[Row],
     query: &str,
-    lines: usize,
 ) {
     let mut state = state.borrow_mut();
-
-    let needle = query.trim().to_lowercase();
-    let needle_chars: Vec<char> = needle.chars().collect();
-
-    let mut ranked: Vec<(usize, i32)> = if needle.is_empty() {
-        // No query: pure popularity order, ties broken by recency then name.
-        (0..state.items.len()).map(|i| (i, 0)).collect()
-    } else {
-        state
-            .items
-            .iter()
-            .enumerate()
-            .filter_map(|(i, item)| {
-                let best = item
-                    .fields
-                    .iter()
-                    .filter_map(|(text, weight)| {
-                        matcher::score(&needle, &needle_chars, text)
-                            .map(|s| (s as f32 * weight) as i32)
-                    })
-                    .max()?;
-                Some((i, best + popularity_bonus(item.count)))
-            })
-            .collect()
-    };
-
-    if needle.is_empty() {
-        ranked.sort_by(|&(a, _), &(b, _)| {
-            let (a, b) = (&state.items[a], &state.items[b]);
-            b.count
-                .cmp(&a.count)
-                .then_with(|| b.last_used.cmp(&a.last_used))
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
-    } else {
-        ranked.sort_by(|&(ai, asc), &(bi, bsc)| {
-            let (a, b) = (&state.items[ai], &state.items[bi]);
-            bsc.cmp(&asc)
-                .then_with(|| b.count.cmp(&a.count))
-                .then_with(|| a.name.len().cmp(&b.name.len()))
-        });
-    }
-
-    state.shown = ranked.into_iter().take(lines).map(|(i, _)| i).collect();
+    state.shown = rank(&state.entries, query, rows.len());
     selected.set(0);
 
-    while let Some(child) = list.first_child() {
-        list.remove(&child);
+    for (position, row) in rows.iter().enumerate() {
+        match state.shown.get(position) {
+            Some(&index) => row.show(index, &state.entries[index], &state.targets[index]),
+            None => row.hide(),
+        }
     }
-    for &index in &state.shown {
-        list.append(&build_row(&state.items[index]));
-    }
-    if let Some(row) = list.row_at_index(0) {
-        list.select_row(Some(&row));
+    if state.shown.is_empty() {
+        list.select_row(None::<&gtk::ListBoxRow>);
+    } else {
+        list.select_row(Some(&rows[0].row));
     }
 }
 
@@ -791,36 +1007,10 @@ fn popularity_bonus(count: u32) -> i32 {
     }
 }
 
-fn build_row(item: &Item) -> gtk::ListBoxRow {
-    let row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(14)
-        .css_classes(["row-body"])
-        .build();
-
-    let icon = match &item.target {
-        Target::Desktop(info) => match info.icon() {
-            Some(gicon) => gtk::Image::from_gicon(&gicon),
-            None => gtk::Image::from_icon_name("application-x-executable"),
-        },
-        Target::AppImage(app) => match &app.icon {
-            Some(name) => gtk::Image::from_icon_name(name),
-            None => gtk::Image::from_icon_name("application-x-executable"),
-        },
-    };
-    icon.set_pixel_size(40);
-    row.append(&icon);
-
-    row.append(&label(&item.name, "name"));
-
-    gtk::ListBoxRow::builder().child(&row).css_classes(["result"]).build()
-}
-
 /// `max_width_chars(1)` lets the label shrink below its natural size, which is
 /// what makes ellipsizing actually kick in inside a fixed width panel.
-fn label(text: &str, class: &str) -> gtk::Label {
+fn label(class: &str) -> gtk::Label {
     gtk::Label::builder()
-        .label(text)
         .css_classes([class])
         .xalign(0.0)
         .hexpand(true)
@@ -834,6 +1024,7 @@ fn move_selection(
     state: &Rc<RefCell<State>>,
     selected: &Selected,
     list: &gtk::ListBox,
+    rows: &[Row],
     delta: i32,
 ) {
     let len = state.borrow().shown.len();
@@ -841,10 +1032,10 @@ fn move_selection(
         return;
     }
     // Wrap around, like fuzzel does.
-    let next = (selected.get() as i32 + delta).rem_euclid(len as i32);
-    selected.set(next as usize);
-    if let Some(row) = list.row_at_index(next) {
-        list.select_row(Some(&row));
+    let next = (selected.get() as i32 + delta).rem_euclid(len as i32) as usize;
+    selected.set(next);
+    if let Some(row) = rows.get(next) {
+        list.select_row(Some(&row.row));
     }
 }
 
@@ -854,7 +1045,7 @@ fn activate(state: &Rc<RefCell<State>>, position: usize, window: &gtk::Window) {
         state
             .shown
             .get(position)
-            .map(|&index| (state.items[index].target.clone(), state.items[index].id.clone()))
+            .map(|&index| (state.targets[index].clone(), state.entries[index].id.clone()))
     };
     let Some((target, id)) = target else { return };
 
@@ -917,8 +1108,195 @@ fn activate(state: &Rc<RefCell<State>>, position: usize, window: &gtk::Window) {
             }
         }
     };
+    // Close first: recording the launch flushes the store to disk, and there
+    // is no reason for the launcher to stay on screen while that happens.
+    window.close();
     if launched {
         state.borrow_mut().usage.record(&id);
     }
-    window.close();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An entry as the ranking sees it: no GIO, no GTK.
+    fn entry(name: &str, count: u32, last_used: u64) -> Entry {
+        Entry {
+            id: format!("{name}.desktop"),
+            name: name.to_owned(),
+            fields: vec![field(name, 1.0)],
+            count,
+            last_used,
+        }
+    }
+
+    /// `load_items` leaves the list in folded-name order and `rank` relies on
+    /// it, so the fixtures here do the same.
+    fn sorted(mut entries: Vec<Entry>) -> Vec<Entry> {
+        entries.sort_by(|a, b| a.sort_key().cmp(b.sort_key()));
+        entries
+    }
+
+    fn names(entries: &[Entry], shown: &[usize]) -> Vec<String> {
+        shown.iter().map(|&i| entries[i].name.clone()).collect()
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn parse(list: &[&str]) -> Config {
+        parse_args(Config::default(), args(list))
+            .expect("should parse")
+            .expect("should not be --help")
+    }
+
+    #[test]
+    fn flags_override_the_defaults() {
+        let config = parse(&["-l", "9", "-w", "900", "-p", "run:", "-q", "fire", "-d", "0.5"]);
+        assert_eq!(config.lines, 9);
+        assert_eq!(config.width, 900);
+        assert_eq!(config.placeholder, "run:");
+        assert_eq!(config.query, "fire");
+        assert_eq!(config.dim, 0.5);
+    }
+
+    #[test]
+    fn flags_override_the_file_layer_they_are_given() {
+        let base = Config { lines: 3, blur: 12, ..Config::default() };
+        let config = parse_args(base, args(&["-l", "7"])).unwrap().unwrap();
+        assert_eq!(config.lines, 7);
+        // Untouched by a flag, so the value handed in survives.
+        assert_eq!(config.blur, 12);
+    }
+
+    #[test]
+    fn out_of_range_values_are_clamped() {
+        let config = parse(&["-l", "500", "-w", "10", "-d", "4", "-b", "9000"]);
+        assert_eq!(config.lines, 50);
+        assert_eq!(config.width, 240);
+        assert_eq!(config.dim, 1.0);
+        assert_eq!(config.blur, 200);
+    }
+
+    #[test]
+    fn blur_takes_an_optional_radius() {
+        assert_eq!(parse(&["-b"]).blur, DEFAULT_BLUR);
+        assert_eq!(parse(&["-b", "12"]).blur, 12);
+        // A following option must not be eaten as the radius.
+        let config = parse(&["-b", "-l", "4"]);
+        assert_eq!(config.blur, DEFAULT_BLUR);
+        assert_eq!(config.lines, 4);
+        // Last flag wins, in both directions.
+        assert_eq!(parse(&["-b", "20", "--no-blur"]).blur, 0);
+        assert_eq!(parse(&["--no-blur", "-b", "20"]).blur, 20);
+    }
+
+    #[test]
+    fn bad_arguments_are_rejected() {
+        assert!(parse_args(Config::default(), args(&["--nope"])).is_err());
+        assert!(parse_args(Config::default(), args(&["-l"])).is_err());
+        assert!(parse_args(Config::default(), args(&["-l", "many"])).is_err());
+        // Parses as a float and survives `clamp`, so it needs its own check —
+        // it would otherwise reach the stylesheet as `rgba(..., NaN)`.
+        assert!(parse_args(Config::default(), args(&["-d", "nan"])).is_err());
+        assert!(parse_args(Config::default(), args(&["-d", "inf"])).is_err());
+        assert!(parse(&["-d", "0.25"]).dim.is_finite());
+    }
+
+    #[test]
+    fn a_lower_weight_is_worth_less_whatever_the_sign() {
+        // Multiplying would have made the smaller weight the larger number.
+        assert!(weigh(-31, 0.45) > weigh(-31, 0.35));
+        assert!(weigh(80, 0.45) > weigh(80, 0.35));
+        assert_eq!(weigh(0, 0.45), 0);
+    }
+
+    #[test]
+    fn a_poor_name_match_still_outranks_a_poor_comment_match() {
+        // Both score badly enough to go negative, which is where the weighting
+        // used to invert and put the description first.
+        let mut described = entry("Aardvark Nine", 0, 0);
+        described
+            .fields
+            .push(field("a tool for organising the zebra photographs you keep", 0.35));
+        let entries = sorted(vec![described, entry("Zebra", 0, 0)]);
+        assert_eq!(names(&entries, &rank(&entries, "zebra", 6))[0], "Zebra");
+    }
+
+    #[test]
+    fn help_asks_for_no_window() {
+        assert!(parse_args(Config::default(), args(&["-h"])).unwrap().is_none());
+    }
+
+    #[test]
+    fn popularity_is_a_bonus_on_a_log_curve() {
+        assert_eq!(popularity_bonus(0), 0);
+        assert!(popularity_bonus(1) > 0);
+        assert!(popularity_bonus(10) > popularity_bonus(1));
+        // Ten times the launches is worth well under ten times the bonus.
+        assert!(popularity_bonus(100) < popularity_bonus(10) * 2);
+    }
+
+    #[test]
+    fn an_empty_query_is_most_used_first() {
+        let entries = sorted(vec![
+            entry("Alacritty", 0, 0),
+            entry("Firefox", 9, 100),
+            entry("Gimp", 3, 400),
+        ]);
+        assert_eq!(names(&entries, &rank(&entries, "", 6)), ["Firefox", "Gimp", "Alacritty"]);
+    }
+
+    #[test]
+    fn equally_used_entries_fall_back_to_recency_then_name() {
+        let entries = sorted(vec![
+            entry("Zathura", 2, 500),
+            entry("Alacritty", 2, 500),
+            entry("Gimp", 2, 900),
+        ]);
+        assert_eq!(names(&entries, &rank(&entries, "", 6)), ["Gimp", "Alacritty", "Zathura"]);
+    }
+
+    #[test]
+    fn the_result_list_is_capped_at_lines() {
+        let entries = sorted((0..200).map(|i| entry(&format!("app{i:03}"), i, 0)).collect());
+        let shown = rank(&entries, "", 6);
+        assert_eq!(shown.len(), 6);
+        assert_eq!(names(&entries, &shown)[0], "app199");
+        assert_eq!(rank(&entries, "app", 4).len(), 4);
+    }
+
+    #[test]
+    fn a_query_ranks_by_match_quality_not_popularity_alone() {
+        let entries = sorted(vec![entry("Firefox", 0, 0), entry("Files", 40, 900)]);
+        // "firef" is a much better match than anything in "files", so the
+        // popularity bonus must not be able to bury it.
+        assert_eq!(names(&entries, &rank(&entries, "firef", 6)), ["Firefox"]);
+    }
+
+    #[test]
+    fn popularity_breaks_a_tie_between_equal_matches() {
+        // Both are a clean prefix match for "term", so nothing but the tie
+        // breaks separates them and the shorter name comes first.
+        let cold = sorted(vec![entry("Termite", 0, 0), entry("Terminal", 0, 0)]);
+        assert_eq!(names(&cold, &rank(&cold, "term", 6)), ["Termite", "Terminal"]);
+
+        // Launch history is enough to turn that around.
+        let warm = sorted(vec![entry("Termite", 0, 0), entry("Terminal", 25, 900)]);
+        assert_eq!(names(&warm, &rank(&warm, "term", 6)), ["Terminal", "Termite"]);
+    }
+
+    #[test]
+    fn a_query_that_matches_nothing_shows_nothing() {
+        let entries = sorted(vec![entry("Firefox", 5, 0), entry("Gimp", 5, 0)]);
+        assert!(rank(&entries, "zzzz", 6).is_empty());
+    }
+
+    #[test]
+    fn rank_folds_the_query_before_matching() {
+        let entries = sorted(vec![entry("Café Player", 0, 0), entry("Gimp", 0, 0)]);
+        assert_eq!(names(&entries, &rank(&entries, "  CAFE  ", 6)), ["Café Player"]);
+    }
 }

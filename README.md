@@ -16,7 +16,8 @@ type, fuzzy match, hit Enter. Built on GTK4 + `wlr-layer-shell`.
   sway, Hyprland, Wayfire — anything wlroots-based. The screenshot is the single most expensive
   thing the launcher does, so it is only taken when asked for; without `-b`, and on a
   compositor without screencopy, the backdrop is the scrim alone.
-- **Large input, small results** — 26px search field above 6 result rows at 14px.
+- **Large input, small results** — 39px search field above 6 result rows at 21px (both scale
+  with `font_size`).
 - **No rules, frames or separators** — grouping is done purely with spacing and a single
   rounded highlight on the selected row. Rows show the application name only; the `Comment`
   and `Keywords` are still searched, just not displayed.
@@ -164,16 +165,17 @@ start.
 
 Dimming is a scrim over a transparent fullscreen surface and costs nothing measurable. `-b`
 adds the blur, and that is what costs: a screenshot means a compositor round trip and a
-readback of the entire framebuffer. On this desktop it is the difference between a 39ms and a
-58ms first frame; on a laptop it is considerably more, which is why it is opt-in.
+readback of the entire framebuffer. On the machine in [Startup](#startup) it adds about 20ms to
+the first frame, and more on a slower one, which is why it is opt-in.
 
 The screenshot is taken before the window is mapped, so the launcher is never in its own
 snapshot, and the backdrop is a frozen frame for as long as the launcher is open.
 
 Blurring runs on a downscaled copy: the capture is sampled down to a longest edge of 480px,
 three separable box passes approximate a Gaussian, and the renderer scales the small texture
-back up when it draws. Capture plus blur is around 25ms for a 2560x1440 output. It happens on
-a worker thread while GTK starts up, so part of it is free — but only part.
+back up when it draws. The blur is about 5ms for a 2560x1440 output, and the capture is
+whatever the compositor takes to hand the frame over. Both happen on a worker thread while GTK
+starts up, so part of it is free — but only part.
 
 With more than one output, each is captured, and the shot is paired with the monitor the
 compositor put the layer surface on by connector name (`DP-1`, `HDMI-A-1`).
@@ -181,9 +183,10 @@ compositor put the layer surface on by connector name (`DP-1`, `HDMI-A-1`).
 ## Startup
 
 A launcher is judged on the delay between the keybind and the first frame, so the work is
-arranged to overlap rather than queue up. Worker threads start before GTK does — one reads the
-desktop files, and with `-b` a second captures and blurs the backdrop over its own Wayland
-connection — while the main thread brings the toolkit up. They are joined before the window is
+arranged to overlap rather than queue up. Worker threads start before GTK does — one builds the
+whole application list (GIO's `AppInfo::all()`, the usage counts, folding and sorting), and with
+`-b` a second captures and blurs the backdrop over its own Wayland connection — while the main
+thread brings the toolkit up. They are joined before the window is
 presented, which is the only ordering that has to hold: the screenshot must predate the map.
 
 Three defaults exist purely to keep a process that lives for a few seconds from paying for
@@ -193,33 +196,39 @@ things it never uses. Each one gives way to an explicit setting in the environme
 | --- | --- | --- |
 | `gtk::init`, no `GtkApplication` | `GApplication` registers on the session bus before it will emit `activate` | — |
 | `GSK_RENDERER=cairo` | building a GL or Vulkan context costs more than this UI ever spends drawing | set `GSK_RENDERER` |
-| `GTK_THEME=Adwaita` | the launcher paints over the user theme anyway, and a big one is a quarter of a megabyte of CSS to parse first | set `GTK_THEME` |
+| `GTK_THEME=Empty` | the stylesheet styles every widget itself, so any theme underneath is parsed only to be painted over; GTK's blank built-in theme is 28 bytes of CSS against ~150KB for the default one | set `GTK_THEME` |
 
 `LAUNCHR_TIMING=1` prints the breakdown to stderr:
 
 ```
 $ LAUNCHR_TIMING=1 launchr -b
 launchr:     0.0ms  main
-launchr:    15.2ms  gtk init
-launchr:    48.6ms  captured
-launchr:    63.3ms  blurred
-launchr:    71.4ms  css loaded
-launchr:    78.0ms  items loaded
-launchr:    78.1ms  backdrop collected
-launchr:    83.3ms  rows filled
-launchr:   118.7ms  first frame
+launchr:    14.4ms  items loaded
+launchr:    28.8ms  captured
+launchr:    34.8ms  gtk init
+launchr:    37.4ms  blurred
+launchr:    71.2ms  css loaded
+launchr:    71.2ms  items joined
+launchr:    71.2ms  backdrop collected
+launchr:    71.2ms  textures
+launchr:    75.7ms  rows filled
+launchr:   107.1ms  presented
+launchr:   144.2ms  first frame
 ```
 
-The backdrop is collected after the item list is built rather than before, so `AppInfo::all()`
-— which reparses every desktop file, and is the most expensive thing left on the main thread —
-overlaps the capture instead of queueing behind it. Neither wait is unbounded: every compositor
-exchange after the registry is up runs on a 300ms deadline, and the main thread gives the whole
-worker 900ms before it settles for a dim-only window.
+`items loaded`, `captured` and `blurred` come from the worker threads, which is why they land
+between the main thread's marks. `first frame` is the end of the first paint, not the start of
+it: the paint itself is some 35ms of software rendering at this size. Neither wait is
+unbounded: every compositor exchange after the registry is up runs on a 300ms deadline, and the
+main thread gives the whole worker 900ms before it settles for a dim-only window.
 
-What is left is nearly all GTK — opening the display, initialising the style cascade and
-mapping the surface — so if a machine is slower than this, that is the place to look first.
-Numbers above are a 2560x1440 output on a Ryzen 5 5600; without `-b` the same machine reaches
-the first frame in about 110ms.
+What is left is nearly all GTK — opening the display, loading styles (`css loaded`), measuring
+and mapping the surface, and the first paint — so if a machine is slower than this, that is the
+place to look first. `GtkSettings` always parses `~/.config/gtk-4.0/gtk.css`, whatever
+`GTK_THEME` says; a theme installer that links a full theme there (238KB for the one on this
+machine) is most of the gap between `gtk init` and `css loaded` above, and about 23ms of the
+first frame. Numbers above are a 2560x1440 output on a Ryzen 5 PRO 3500U laptop; without `-b`
+the same machine reaches the first frame in about 120ms.
 
 ## Where the data lives
 
@@ -238,18 +247,24 @@ store.
 
 | File | Role |
 | --- | --- |
-| `src/main.rs` | layer-shell window, widget tree, key handling, ranking, `.desktop` scan |
+| `src/main.rs` | startup sequence: what runs on which thread, and when |
+| `src/cli.rs` | command line parsing |
+| `src/config.rs` | merged settings, `~/.config/launchr.json` loading and validation |
+| `src/apps.rs` | application list (GIO desktop entries + AppImages) and launching |
+| `src/rank.rs` | ranking: match quality plus popularity |
+| `src/ui.rs` | layer-shell window, widget tree, key handling |
 | `src/capture.rs` | `wlr-screencopy-v1` client |
 | `src/blur.rs` | downscale + box blur |
 | `src/matcher.rs` | fuzzy subsequence scorer |
 | `src/usage.rs` | launch-count store |
-| `src/config.rs` | `~/.config/launchr.json` loading and validation |
+| `src/timing.rs` | `LAUNCHR_TIMING=1` breakdown |
 | `src/style.css` | Tokyo Night theme template, compiled into the binary |
 
 Applications come from GIO's `AppInfo::all()`, which handles `NoDisplay`, `OnlyShowIn`, `Exec`
-field codes and `Terminal=true` for us. GIO's Rust bindings expose no `GDesktopAppInfo`, so
-`Keywords=` and `GenericName=` are read straight from the desktop files in `$XDG_DATA_DIRS`
-and folded into the searchable text at a lower weight than the name.
+field codes and `Terminal=true` for us. `Keywords=` and `GenericName=`, which the `AppInfo`
+interface leaves out, come from the same `GDesktopAppInfo` objects, so each desktop file is
+parsed once. Both the translated and the untranslated values are searched, at a lower weight
+than the name, so a translated desktop still finds a browser by "browser".
 
 ## Tests
 
@@ -258,5 +273,7 @@ cargo test
 ```
 
 Covers the scorer's ordering guarantees (prefix over scattered, word start over mid-word,
-shorter name on a tie), the blur's flat-image/point-spread/transpose behaviour and its format
-handling, and the usage store's round trip and corrupt-line handling.
+shorter name on a tie), the ranking policy (popularity versus match quality, tie breaks), flag
+parsing and the config file's clamping and fallbacks, the blur's flat-image/point-spread/
+brightness/transpose behaviour and its buffer checks, and the usage store's round trip and
+corrupt-line handling.

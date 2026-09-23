@@ -1,13 +1,81 @@
-//! `~/.config/launchr.json` — optional overrides for colors, sizing, and a
-//! list of AppImages to launch directly (they have no `.desktop` file, so GIO
-//! never finds them on its own). Everything in the file is optional; a
-//! missing file, a missing field, or invalid JSON just falls back to the
-//! built-in defaults rather than failing the launcher, and a single bad
-//! field (an unparsable color, an AppImage that doesn't exist) is skipped
-//! with a warning on stderr rather than rejecting the whole file.
+//! The launcher's settings, built in three layers: the built-in defaults
+//! ([`Config::default`]), then `~/.config/launchr.json`
+//! ([`Config::with_file_overrides`]), then the command line (`cli::parse_args`).
+//!
+//! The file holds optional overrides for colors, sizing, and a list of
+//! AppImages to launch directly (they have no `.desktop` file, so GIO never
+//! finds them on its own). Everything in it is optional; a missing file, a
+//! missing field, or invalid JSON just falls back to the built-in defaults
+//! rather than failing the launcher, and a single bad field (an unparsable
+//! color, an AppImage that doesn't exist) is skipped with a warning on stderr
+//! rather than rejecting the whole file.
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+
+pub struct Config {
+    pub lines: usize,
+    pub width: i32,
+    pub placeholder: String,
+    pub query: String,
+    /// Blur radius in screen pixels; 0 means no screenshot is taken at all.
+    /// Off by default: the capture is a full compositor round trip plus a
+    /// readback of the whole framebuffer, which is most of the launcher's
+    /// startup on a slow machine.
+    pub blur: u32,
+    /// Opacity of the scrim painted over the blurred backdrop.
+    pub dim: f64,
+    /// Font size, in pixels, of a result row's name. The search entry scales
+    /// with it (see `ui::render_style`) so the "large input, small results"
+    /// proportion holds at any size.
+    pub font_size: u32,
+    pub colors: Colors,
+    /// Directly launchable AppImages, from `~/.config/launchr.json` — they
+    /// have no `.desktop` file, so GIO never surfaces them on its own.
+    pub appimages: Vec<AppImageConfig>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            lines: 6,
+            width: 680,
+            placeholder: String::new(),
+            query: String::new(),
+            blur: 0,
+            dim: 0.75,
+            font_size: 21,
+            colors: Colors::default(),
+            appimages: Vec::new(),
+        }
+    }
+}
+
+impl Config {
+    /// Applies `~/.config/launchr.json` on top of `self`. Called before
+    /// `cli::parse_args`, so a CLI flag still wins over the file.
+    pub fn with_file_overrides(self) -> Self {
+        self.overridden_by(load())
+    }
+
+    fn overridden_by(mut self, file: FileOverrides) -> Self {
+        self.colors = file.colors;
+        self.appimages = file.appimages;
+        if let Some(v) = file.font_size {
+            self.font_size = v;
+        }
+        if let Some(v) = file.lines {
+            self.lines = v;
+        }
+        if let Some(v) = file.dim {
+            self.dim = v;
+        }
+        if let Some(v) = file.blur {
+            self.blur = v;
+        }
+        self
+    }
+}
 
 #[derive(Clone)]
 pub struct Colors {
@@ -41,14 +109,16 @@ pub struct AppImageConfig {
     pub icon: Option<String>,
 }
 
+/// What the file sets, already validated and clamped. `colors` is complete:
+/// a field the file leaves out or gets wrong holds its default.
 #[derive(Default)]
-pub struct FileOverrides {
-    pub colors: Colors,
-    pub font_size: Option<u32>,
-    pub lines: Option<usize>,
-    pub dim: Option<f64>,
-    pub blur: Option<u32>,
-    pub appimages: Vec<AppImageConfig>,
+struct FileOverrides {
+    colors: Colors,
+    font_size: Option<u32>,
+    lines: Option<usize>,
+    dim: Option<f64>,
+    blur: Option<u32>,
+    appimages: Vec<AppImageConfig>,
 }
 
 #[derive(Deserialize, Default)]
@@ -97,12 +167,15 @@ struct FileConfig {
     appimages: Vec<FileAppImage>,
 }
 
-/// Accepted ranges, shared with `parse_args` in `main.rs` so a value set in
-/// the file and the same value set by a flag are clamped identically.
+/// Accepted ranges, shared with `cli::parse_args` so a value set in the file
+/// and the same value set by a flag are clamped identically.
 pub const FONT_SIZE: std::ops::RangeInclusive<u32> = 8..=60;
 pub const LINES: std::ops::RangeInclusive<usize> = 1..=50;
 pub const DIM: std::ops::RangeInclusive<f64> = 0.0..=1.0;
 pub const MAX_BLUR: u32 = 200;
+/// Flag-only, but kept beside the others so every accepted range is in one
+/// place.
+pub const WIDTH: std::ops::RangeInclusive<i32> = 240..=3000;
 
 fn config_path() -> Option<PathBuf> {
     let xdg = std::env::var_os("XDG_CONFIG_HOME")
@@ -146,7 +219,7 @@ fn valid_hex(value: String, field: &str) -> Option<String> {
     }
 }
 
-pub fn load() -> FileOverrides {
+fn load() -> FileOverrides {
     match config_path() {
         Some(path) => load_from(&path),
         None => FileOverrides::default(),
@@ -273,6 +346,17 @@ mod tests {
         assert_eq!(overrides.colors.accent, "#ff0000");
         // One bad field is skipped; the rest of the file still applies.
         assert_eq!(overrides.colors.muted, Colors::default().muted);
+    }
+
+    #[test]
+    fn the_file_layer_overrides_only_what_it_sets() {
+        let file = FileOverrides { lines: Some(3), blur: Some(12), ..FileOverrides::default() };
+        let config = Config::default().overridden_by(file);
+        assert_eq!(config.lines, 3);
+        assert_eq!(config.blur, 12);
+        // Left out of the file, so the built-in default survives.
+        assert_eq!(config.dim, Config::default().dim);
+        assert_eq!(config.font_size, Config::default().font_size);
     }
 
     #[test]

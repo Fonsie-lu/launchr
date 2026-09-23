@@ -1,5 +1,5 @@
 /* Tokyo Night (default) — this is a template, not standalone valid CSS: the
-   __TOKENS__ below are substituted by render_style() in main.rs from
+   __TOKENS__ below are substituted by render_style() in ui.rs from
    Config::colors / Config::font_size before being loaded as a CSS provider.
    Defaults: bg #10111e  panel #1a1b26  fg #c0caf5  selection #283457
    accent #7aa2f7  muted #565f89 — see ~/.config/launchr.json in the README. */

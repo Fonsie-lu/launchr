@@ -18,10 +18,9 @@ cargo test <name>             # run a single test by name/substring
 LAUNCHR_TIMING=1 cargo run --release -- -b   # print the startup timing breakdown to stderr
 ```
 
-`.github/workflows/ci.yml` gates every push and pull request on `cargo fmt --check`,
-`cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked` and
-`cargo build --release --locked`, so a new warning or an unformatted line fails CI — run
-`cargo fmt` and clippy before pushing. `rustfmt.toml` sets `use_small_heuristics = "Max"`.
+There is no CI: `install.sh` is the only build and deploy path. Before pushing, run
+`cargo fmt`, `cargo clippy --all-targets --locked -- -D warnings` and `cargo test --locked`
+by hand. `rustfmt.toml` sets `use_small_heuristics = "Max"`.
 
 Edition 2024, `rust-version = "1.88"` (let chains, `slice::as_chunks`). In this edition
 `std::env::set_var`/`remove_var` are `unsafe`; the only callers are `LaunchEnv::pin` and
@@ -181,10 +180,3 @@ path.
 
 `Comment=`/`Keywords=`/`GenericName=` are folded into the searchable text at
 lower weight than the app name (`apps::weight`) but are never displayed.
-
-## CI setup
-
-The CI workflow installs GTK through the composite action `.github/actions/setup-gtk`, which
-carries the meson/ninja fallback for `gtk4-layer-shell` (only packaged from Ubuntu 24.10 on).
-`.github/dependabot.yml` opens weekly update PRs for crates (gtk-rs and wayland grouped) and
-for the actions themselves.

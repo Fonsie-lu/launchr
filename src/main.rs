@@ -30,8 +30,8 @@ use std::time::{Duration, Instant};
 
 const APP_ID: &str = "ch.bithawk.launchr";
 
-/// How long the main thread waits on the capture worker before giving up and
-/// showing a dim-only window.
+/// How long after spawning the capture worker the main thread gives up on it
+/// and shows a dim-only window.
 ///
 /// The single budget for the whole backdrop: the worker is handed a deadline
 /// derived from it rather than carrying a constant of its own, so there are
@@ -47,18 +47,27 @@ const CAPTURE_SHARE: u32 = 3;
 /// What the capture worker sends back: one blurred image per output.
 type Blurred = Vec<(Option<String>, blur::Image)>;
 
+/// The capture worker's channel, and the point at which the main thread
+/// stops waiting on it.
+struct CaptureJob {
+    receiver: Receiver<Blurred>,
+    /// `BACKDROP_WAIT` after the worker was spawned — not after the main
+    /// thread starts waiting, which is `gtk::init` later, so the whole
+    /// backdrop costs at most `BACKDROP_WAIT`, connection setup included.
+    give_up_at: Instant,
+}
+
 fn main() -> glib::ExitCode {
     timing::init();
     timing::mark("main");
 
-    // Both overrides happen here, before a single thread exists, and not down
-    // beside `gtk::init` where they belong logically. glibc's `setenv` can
-    // reallocate `environ`, and both workers below read the environment — the
-    // catalog for XDG_DATA_HOME/XDG_DATA_DIRS, the capture for WAYLAND_DISPLAY
-    // — so writing to it once they are running is a data race, not a tidiness
-    // question. An explicit value in the environment wins over either, and
-    // apps launched from here get the original value (or its absence) back —
-    // see `LaunchEnv`.
+    // Everything up to the first `thread::spawn` below writes to the process
+    // environment or the locale, and is done here, before a single thread
+    // exists, rather than down beside `gtk::init` where it belongs logically.
+    // glibc's `setenv` can reallocate `environ`, and both workers read the
+    // environment — the catalog for XDG_DATA_HOME/XDG_DATA_DIRS and the
+    // locale, the capture for WAYLAND_DISPLAY — so writing to it once they
+    // are running is a data race, not a tidiness question.
     //
     // GSK_RENDERER: GL/Vulkan context creation dominates the first frame of a
     // process that only lives for a few seconds; the cairo renderer draws this
@@ -70,32 +79,38 @@ fn main() -> glib::ExitCode {
     // for the default one, and nothing for the style cascade to match every
     // widget against. Should a GTK release ever drop it, GTK falls back to
     // the default theme — the same look, just the old startup cost.
-    let launch_env = apps::LaunchEnv::pin(&[("GSK_RENDERER", "cairo"), ("GTK_THEME", "Empty")]);
-
-    // `gtk::init` writes to the environment and the locale as well, and both
-    // are just as unsafe with the workers running. It unsets the activation
-    // token it was started with, so taking that out here first leaves it
-    // nothing to remove; the token is handed back to GDK once the window
-    // exists. And it would call `setlocale(LC_ALL, "")`, which is done here
-    // instead, with GTK told to leave it alone.
-    let activation_token = take_activation_token();
-    gtk::disable_setlocale();
-    // SAFETY: no other thread exists yet, and the argument is a valid C
-    // string; the returned locale name is not used.
-    unsafe {
+    //
+    // An explicit value in the environment wins over either, and apps
+    // launched from here get the original value (or its absence) back — see
+    // `LaunchEnv`.
+    //
+    // `gtk::init` writes to the environment and the locale as well. It unsets
+    // the activation token it was started with, so taking that out here first
+    // leaves it nothing to remove; the token is handed back to GDK once the
+    // window exists. And it would call `setlocale(LC_ALL, "")`, which is done
+    // here instead, with GTK told to leave it alone.
+    //
+    // SAFETY: no other thread exists yet, and the argument to `setlocale` is
+    // a valid C string; the locale name it returns is not used.
+    let (launch_env, activation_token) = unsafe {
+        let launch_env = apps::LaunchEnv::pin(&[("GSK_RENDERER", "cairo"), ("GTK_THEME", "Empty")]);
+        let activation_token = take_activation_token();
+        gtk::disable_setlocale();
         libc::setlocale(libc::LC_ALL, c"".as_ptr());
-    }
+        (launch_env, activation_token)
+    };
 
-    let mut config =
-        match cli::parse_args(config::Config::default().with_file_overrides(), std::env::args().skip(1))
-        {
-            Ok(Some(config)) => config,
-            Ok(None) => return glib::ExitCode::SUCCESS,
-            Err(message) => {
-                eprintln!("launchr: {message}");
-                return glib::ExitCode::FAILURE;
-            }
-        };
+    let mut config = match cli::parse_args(
+        config::Config::default().with_file_overrides(),
+        std::env::args().skip(1),
+    ) {
+        Ok(Some(config)) => config,
+        Ok(None) => return glib::ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("launchr: {message}");
+            return glib::ExitCode::FAILURE;
+        }
+    };
 
     // The item list is GIO and plain file reads, none of it GTK, so it is
     // built on a worker while the main thread brings the toolkit up. Spawned
@@ -150,13 +165,17 @@ fn main() -> glib::ExitCode {
 /// the xdg-activation protocol names it, else the older `DESKTOP_STARTUP_ID`.
 /// An app launched from here must not inherit it either way; it gets a fresh
 /// one from the launch context.
-fn take_activation_token() -> Option<String> {
-    let token = ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"]
-        .iter()
-        .filter_map(|name| std::env::var(name).ok())
-        .find(|token| !token.is_empty());
-    std::env::remove_var("XDG_ACTIVATION_TOKEN");
-    std::env::remove_var("DESKTOP_STARTUP_ID");
+///
+/// # Safety
+///
+/// No other thread may exist yet, for the same reason as `LaunchEnv::pin`.
+unsafe fn take_activation_token() -> Option<String> {
+    const NAMES: [&str; 2] = ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"];
+    let token = NAMES.iter().filter_map(|name| std::env::var(name).ok()).find(|t| !t.is_empty());
+    for name in NAMES {
+        // SAFETY: the caller guarantees this thread is the only one.
+        unsafe { std::env::remove_var(name) };
+    }
     token
 }
 
@@ -166,9 +185,10 @@ fn take_activation_token() -> Option<String> {
 /// window is presented, which is the point the "screenshot before map"
 /// ordering actually has to hold. The result comes back over a channel rather
 /// than a join so the wait can time out — see `BACKDROP_WAIT`.
-fn spawn_capture(radius: u32) -> Receiver<Blurred> {
+fn spawn_capture(radius: u32) -> CaptureJob {
     let (sender, receiver) = std::sync::mpsc::channel();
-    let deadline = Instant::now() + BACKDROP_WAIT / CAPTURE_SHARE;
+    let started = Instant::now();
+    let deadline = started + BACKDROP_WAIT / CAPTURE_SHARE;
     std::thread::spawn(move || {
         let frames = capture::capture_outputs(deadline);
         timing::mark("captured");
@@ -183,21 +203,20 @@ fn spawn_capture(radius: u32) -> Receiver<Blurred> {
         timing::mark("blurred");
         let _ = sender.send(images);
     });
-    receiver
+    CaptureJob { receiver, give_up_at: started + BACKDROP_WAIT }
 }
 
 /// Wait for the capture worker, or give up on it at `BACKDROP_WAIT` and show
 /// the scrim alone.
-fn collect_backdrops(receiver: Receiver<Blurred>) -> Vec<ui::Backdrop> {
-    let images = receiver.recv_timeout(BACKDROP_WAIT).unwrap_or_else(|_| {
+fn collect_backdrops(job: CaptureJob) -> Vec<ui::Backdrop> {
+    let left = job.give_up_at.saturating_duration_since(Instant::now());
+    let images = job.receiver.recv_timeout(left).unwrap_or_else(|_| {
         eprintln!("launchr: backdrop was not ready in time, dimming only");
         Vec::new()
     });
     timing::mark("backdrop collected");
-    let backdrops = images
-        .into_iter()
-        .map(|(connector, image)| ui::Backdrop::new(connector, image))
-        .collect();
+    let backdrops =
+        images.into_iter().map(|(connector, image)| ui::Backdrop::new(connector, image)).collect();
     timing::mark("textures");
     backdrops
 }

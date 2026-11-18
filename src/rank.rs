@@ -22,11 +22,7 @@ fn weigh(score: i32, weight: f32) -> i32 {
 /// Frequently launched apps get a boost, but on a log curve so a good name
 /// match on a fresh app can still win.
 fn popularity_bonus(count: u32) -> i32 {
-    if count == 0 {
-        0
-    } else {
-        (((count + 1) as f32).ln() * 40.0) as i32
-    }
+    if count == 0 { 0 } else { (((count + 1) as f32).ln() * 40.0) as i32 }
 }
 
 /// Keep the `lines` best of `ranked` in order and drop the rest. Generic so
@@ -130,9 +126,7 @@ mod tests {
         // Both score badly enough to go negative, which is where the weighting
         // used to invert and put the description first.
         let mut described = entry("Aardvark Nine", 0, 0);
-        described
-            .fields
-            .push(field("a tool for organising the zebra photographs you keep", 0.35));
+        described.fields.push(field("a tool for organising the zebra photographs you keep", 0.35));
         let entries = sorted(vec![described, entry("Zebra", 0, 0)]);
         assert_eq!(names(&entries, &rank(&entries, "zebra", 6))[0], "Zebra");
     }
@@ -148,11 +142,8 @@ mod tests {
 
     #[test]
     fn an_empty_query_is_most_used_first() {
-        let entries = sorted(vec![
-            entry("Alacritty", 0, 0),
-            entry("Firefox", 9, 100),
-            entry("Gimp", 3, 400),
-        ]);
+        let entries =
+            sorted(vec![entry("Alacritty", 0, 0), entry("Firefox", 9, 100), entry("Gimp", 3, 400)]);
         assert_eq!(names(&entries, &rank(&entries, "", 6)), ["Firefox", "Gimp", "Alacritty"]);
     }
 

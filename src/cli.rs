@@ -23,19 +23,40 @@ const HELP: &str = "launchr — Wayland application launcher\n\n\
      directly launchable AppImages can also be set in\n\
      ~/.config/launchr.json; flags above override it.";
 
-fn flag_value(flag: &str, next: Option<String>) -> Result<String, String> {
-    next.ok_or_else(|| format!("{flag} needs a value"))
+/// One argument split into its flag and, for `--flag=value`, the value
+/// written into it. Only long options take that form: `-l=5` stays whole,
+/// and is rejected as an unknown argument.
+fn split_attached(arg: String) -> (String, Option<String>) {
+    match arg.split_once('=') {
+        Some((flag, value)) if flag.starts_with("--") => (flag.to_owned(), Some(value.to_owned())),
+        _ => (arg, None),
+    }
 }
 
-fn flag_number<T: std::str::FromStr>(flag: &str, next: Option<String>) -> Result<T, String> {
-    flag_value(flag, next)?
-        .parse()
-        .map_err(|_| format!("{flag} expects a number"))
+/// The flag's value: the one written into it, else the next argument.
+fn flag_value(
+    flag: &str,
+    attached: Option<String>,
+    args: &mut impl Iterator<Item = String>,
+) -> Result<String, String> {
+    attached.or_else(|| args.next()).ok_or_else(|| format!("{flag} needs a value"))
+}
+
+fn parse_number<T: std::str::FromStr>(flag: &str, value: String) -> Result<T, String> {
+    value.parse().map_err(|_| format!("{flag} expects a number"))
+}
+
+fn no_value(flag: &str, attached: Option<String>) -> Result<(), String> {
+    match attached {
+        Some(_) => Err(format!("{flag} takes no value")),
+        None => Ok(()),
+    }
 }
 
 /// `base` is the built-in defaults with `~/.config/launchr.json` already
 /// applied; any flag here overrides it further. `Ok(None)` means `--help` was
-/// printed and no window is wanted.
+/// printed and no window is wanted. Every flag that takes a value takes it
+/// either as the next argument or written in, as `--lines=9`.
 pub fn parse_args<I>(base: Config, args: I) -> Result<Option<Config>, String>
 where
     I: IntoIterator<Item = String>,
@@ -43,45 +64,54 @@ where
     let mut config = base;
     let mut args = args.into_iter().peekable();
     while let Some(arg) = args.next() {
-        match arg.as_str() {
+        let (flag, attached) = split_attached(arg);
+        match flag.as_str() {
             "-h" | "--help" => {
+                no_value(&flag, attached)?;
                 println!("{HELP}");
                 return Ok(None);
             }
             "-l" | "--lines" => {
-                let lines = flag_number::<usize>(&arg, args.next())?;
+                let lines: usize = parse_number(&flag, flag_value(&flag, attached, &mut args)?)?;
                 config.lines = lines.clamp(*config::LINES.start(), *config::LINES.end());
             }
             "-w" | "--width" => {
-                let width = flag_number::<i32>(&arg, args.next())?;
+                let width: i32 = parse_number(&flag, flag_value(&flag, attached, &mut args)?)?;
                 config.width = width.clamp(*config::WIDTH.start(), *config::WIDTH.end());
             }
-            "-p" | "--prompt" => config.placeholder = flag_value(&arg, args.next())?,
-            "-q" | "--query" => config.query = flag_value(&arg, args.next())?,
+            "-p" | "--prompt" => config.placeholder = flag_value(&flag, attached, &mut args)?,
+            "-q" | "--query" => config.query = flag_value(&flag, attached, &mut args)?,
             "-b" | "--blur" => {
                 // A bare -b means "blur, you pick the radius"; a number after
-                // it sets one. Anything else is the next option, left alone.
-                let radius = match args.peek().and_then(|next| next.parse::<u32>().ok()) {
-                    Some(radius) => {
-                        args.next();
-                        radius
-                    }
-                    None => DEFAULT_BLUR,
+                // it sets one. Anything else is the next option, left alone —
+                // but a value written in has to be a number.
+                let radius = match attached {
+                    Some(value) => parse_number(&flag, value)?,
+                    None => match args.peek().and_then(|next| next.parse::<u32>().ok()) {
+                        Some(radius) => {
+                            args.next();
+                            radius
+                        }
+                        None => DEFAULT_BLUR,
+                    },
                 };
                 config.blur = radius.min(config::MAX_BLUR);
             }
-            "--no-blur" => config.blur = 0,
+            "--no-blur" => {
+                no_value(&flag, attached)?;
+                config.blur = 0;
+            }
             "-d" | "--dim" => {
                 // `"nan".parse::<f64>()` succeeds and `f64::clamp` hands NaN
                 // straight back, which would reach the stylesheet as
                 // `rgba(r, g, b, NaN)` and take the whole scrim out with it.
-                let dim = flag_number::<f64>(&arg, args.next())?;
+                let dim: f64 = parse_number(&flag, flag_value(&flag, attached, &mut args)?)?;
                 if !dim.is_finite() {
-                    return Err(format!("{arg} expects a number"));
+                    return Err(format!("{flag} expects a number"));
                 }
                 config.dim = dim.clamp(*config::DIM.start(), *config::DIM.end());
             }
-            other => return Err(format!("unknown argument: {other}")),
+            _ => return Err(format!("unknown argument: {flag}")),
         }
     }
     Ok(Some(config))
@@ -152,6 +182,25 @@ mod tests {
         assert!(parse_args(Config::default(), args(&["-d", "nan"])).is_err());
         assert!(parse_args(Config::default(), args(&["-d", "inf"])).is_err());
         assert!(parse(&["-d", "0.25"]).dim.is_finite());
+    }
+
+    #[test]
+    fn a_long_flag_takes_its_value_written_in() {
+        let config = parse(&["--lines=9", "--prompt=a=b", "--blur=12", "--dim=0.5"]);
+        assert_eq!(config.lines, 9);
+        // Split at the first `=` only.
+        assert_eq!(config.placeholder, "a=b");
+        assert_eq!(config.blur, 12);
+        assert_eq!(config.dim, 0.5);
+        assert_eq!(parse(&["--query="]).query, "");
+        // A value that looks like a flag is still a value.
+        assert_eq!(parse(&["-q", "--lines=3"]).query, "--lines=3");
+
+        let rejected = |list: &[&str]| parse_args(Config::default(), args(list)).is_err();
+        assert!(rejected(&["--blur=lots"]));
+        assert!(rejected(&["--no-blur=1"]));
+        assert!(rejected(&["--help=me"]));
+        assert!(rejected(&["-l=5"]));
     }
 
     #[test]

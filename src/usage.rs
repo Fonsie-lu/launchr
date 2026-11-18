@@ -18,25 +18,15 @@ pub struct Usage {
 
 impl Usage {
     pub fn load() -> Self {
-        let Some(path) = store_path() else {
-            return Self::default();
-        };
-        let mut entries = HashMap::new();
-        if let Ok(text) = fs::read_to_string(&path) {
-            for line in text.lines() {
-                let mut cols = line.splitn(3, '\t');
-                let (Some(count), Some(last), Some(id)) = (cols.next(), cols.next(), cols.next())
-                else {
-                    continue;
-                };
-                let (Ok(count), Ok(last)) = (count.parse(), last.parse()) else {
-                    continue;
-                };
-                if !id.is_empty() {
-                    entries.insert(id.to_owned(), (count, last));
-                }
-            }
-        }
+        store_path().map_or_else(Self::default, Self::load_from)
+    }
+
+    /// The store at `path`, which is also where `record` writes it back. A
+    /// missing or unreadable file is an empty store, and a line that does not
+    /// parse is skipped.
+    fn load_from(path: PathBuf) -> Self {
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let entries = text.lines().filter_map(parse_line).collect();
         Self { entries, path: Some(path) }
     }
 
@@ -46,10 +36,7 @@ impl Usage {
 
     /// Count one launch of `id` and persist the store.
     pub fn record(&mut self, id: &str) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let slot = self.entries.entry(id.to_owned()).or_insert((0, 0));
         slot.0 = slot.0.saturating_add(1);
         slot.1 = now;
@@ -64,7 +51,7 @@ impl Usage {
         }
 
         let mut rows: Vec<_> = self.entries.iter().collect();
-        rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(b.0)));
+        rows.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(b.0)));
         let mut out = String::new();
         for (id, (count, last)) in rows {
             let _ = writeln!(out, "{count}\t{last}\t{id}");
@@ -80,7 +67,11 @@ impl Usage {
         // Both flushes cost real time on a busy disk. `activate` closes the
         // window before it gets here, so they delay the launcher's own exit
         // rather than the application it just started.
-        let tmp = path.with_extension("tmp");
+        //
+        // The temp file is this process's own: two launchers recording at
+        // once must not write into the same one and rename each other's half
+        // written store into place.
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
         let written = File::create(&tmp).and_then(|mut file| {
             file.write_all(out.as_bytes())?;
             file.sync_all()
@@ -90,12 +81,21 @@ impl Usage {
             return;
         }
         if fs::rename(&tmp, path).is_err() {
+            let _ = fs::remove_file(&tmp);
             return;
         }
         if let Ok(handle) = File::open(dir) {
             let _ = handle.sync_all();
         }
     }
+}
+
+/// `count \t last_used \t id`, as `save` writes it.
+fn parse_line(line: &str) -> Option<(String, (u32, u64))> {
+    let mut cols = line.splitn(3, '\t');
+    let (count, last, id) = (cols.next()?, cols.next()?, cols.next()?);
+    let (count, last) = (count.parse().ok()?, last.parse().ok()?);
+    (!id.is_empty()).then(|| (id.to_owned(), (count, last)))
 }
 
 fn store_path() -> Option<PathBuf> {
@@ -109,12 +109,19 @@ fn store_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
+    /// A store in a directory of its own that does not exist yet, so `save`
+    /// has to create it.
     fn temp_store(name: &str) -> (PathBuf, Usage) {
         let dir = std::env::temp_dir().join(format!("launchr-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let path = dir.join("launchr").join("usage.tsv");
         (path.clone(), Usage { entries: HashMap::new(), path: Some(path) })
+    }
+
+    fn remove(path: &Path) {
+        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
     #[test]
@@ -131,33 +138,28 @@ mod tests {
         usage.record("foot.desktop");
         assert_eq!(usage.get("firefox.desktop").0, 2);
 
-        let reloaded = Usage {
-            entries: {
-                let mut map = HashMap::new();
-                for line in fs::read_to_string(&path).unwrap().lines() {
-                    let cols: Vec<&str> = line.splitn(3, '\t').collect();
-                    map.insert(cols[2].to_owned(), (cols[0].parse().unwrap(), cols[1].parse().unwrap()));
-                }
-                map
-            },
-            path: None,
-        };
+        let reloaded = Usage::load_from(path.clone());
+        remove(&path);
         assert_eq!(reloaded.get("firefox.desktop").0, 2);
         assert_eq!(reloaded.get("foot.desktop").0, 1);
-        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+        assert_eq!(reloaded.get("firefox.desktop").1, usage.get("firefox.desktop").1);
     }
 
     #[test]
     fn corrupt_lines_are_skipped() {
         let (path, mut usage) = temp_store("corrupt");
         usage.record("good.desktop");
-        fs::write(&path, "3\t100\tgood.desktop\ngarbage\nx\ty\tbad.desktop\n").unwrap();
-        let loaded = {
-            std::env::set_var("XDG_DATA_HOME", path.parent().unwrap().parent().unwrap());
-            Usage::load()
-        };
-        assert_eq!(loaded.get("good.desktop").0, 3);
+        fs::write(&path, "3\t100\tgood.desktop\ngarbage\nx\ty\tbad.desktop\n4\t5\t\n").unwrap();
+        let loaded = Usage::load_from(path.clone());
+        remove(&path);
+        assert_eq!(loaded.get("good.desktop"), (3, 100));
         assert_eq!(loaded.get("bad.desktop"), (0, 0));
-        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+        assert_eq!(loaded.entries.len(), 1);
+    }
+
+    #[test]
+    fn a_missing_store_is_empty() {
+        let (path, _) = temp_store("missing");
+        assert!(Usage::load_from(path).entries.is_empty());
     }
 }

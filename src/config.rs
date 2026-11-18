@@ -7,10 +7,12 @@
 //! finds them on its own). Everything in it is optional; a missing file, a
 //! missing field, or invalid JSON just falls back to the built-in defaults
 //! rather than failing the launcher, and a single bad field (an unparsable
-//! color, an AppImage that doesn't exist) is skipped with a warning on stderr
-//! rather than rejecting the whole file.
+//! color, a number given as a string, an AppImage that doesn't exist) is
+//! skipped with a warning on stderr rather than rejecting the whole file. So
+//! is a key nothing reads, which is nearly always a typo.
 
-use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
 pub struct Config {
@@ -106,7 +108,22 @@ impl Default for Colors {
 pub struct AppImageConfig {
     pub name: String,
     pub path: PathBuf,
-    pub icon: Option<String>,
+    pub icon: Option<Icon>,
+}
+
+/// An AppImage's icon: a name looked up in the icon theme, or an image file.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Icon {
+    Name(String),
+    File(PathBuf),
+}
+
+impl Icon {
+    /// A theme icon name never contains a slash, so anything that does is a
+    /// path, with a leading `~/` expanded.
+    fn parse(value: String) -> Self {
+        if value.contains('/') { Icon::File(expand_tilde(&value)) } else { Icon::Name(value) }
+    }
 }
 
 /// What the file sets, already validated and clamped. `colors` is complete:
@@ -121,50 +138,104 @@ struct FileOverrides {
     appimages: Vec<AppImageConfig>,
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct FileColors {
-    background: Option<String>,
-    panel: Option<String>,
-    foreground: Option<String>,
-    selection: Option<String>,
-    accent: Option<String>,
-    muted: Option<String>,
+/// One JSON object of the file, read a key at a time. Each `take` removes
+/// what it reads, so whatever is left at `finish` is a key nothing knows.
+struct Fields {
+    map: Map<String, Value>,
+    /// Where the object sits in the file, for the warnings: empty at the top
+    /// level, else `colors.` or `appimages[2].`.
+    prefix: String,
 }
 
-#[derive(Deserialize)]
-struct FileAppImage {
-    name: String,
-    path: String,
-    icon: Option<String>,
-}
+impl Fields {
+    fn new(value: Value, name: String) -> Option<Self> {
+        let map = serde_json::from_value(value)
+            .inspect_err(|err| eprintln!("launchr: config: ignoring {name}: {err}"))
+            .ok()?;
+        Some(Fields { map, prefix: format!("{name}.") })
+    }
 
-impl FileAppImage {
-    fn into_config(self) -> Option<AppImageConfig> {
-        let path = expand_tilde(&self.path);
-        if self.name.trim().is_empty() {
-            eprintln!("launchr: ignoring appimages entry with an empty name ({path:?})");
-            return None;
+    /// The value at `key`, or `None` — with a warning when there was a value
+    /// but not one of the right type. `null` counts as absent.
+    fn take<T: DeserializeOwned>(&mut self, key: &str) -> Option<T> {
+        let value = self.map.remove(key).filter(|value| !value.is_null())?;
+        serde_json::from_value(value)
+            .inspect_err(|err| eprintln!("launchr: config: ignoring {}{key}: {err}", self.prefix))
+            .ok()
+    }
+
+    fn nested(&mut self, key: &str) -> Option<Fields> {
+        let value = self.map.remove(key).filter(|value| !value.is_null())?;
+        Fields::new(value, format!("{}{key}", self.prefix))
+    }
+
+    fn finish(self) {
+        for key in self.map.keys() {
+            eprintln!("launchr: config: ignoring unknown setting {}{key}", self.prefix);
         }
-        if !path.is_file() {
-            eprintln!("launchr: ignoring appimages entry {path:?}: no such file");
-            return None;
-        }
-        Some(AppImageConfig { name: self.name, path, icon: self.icon })
     }
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct FileConfig {
-    colors: FileColors,
-    font_size: Option<u32>,
-    lines: Option<usize>,
-    dim: Option<f64>,
-    /// Same convention as `-b`/`--blur`: 0 or absent means off, otherwise the
-    /// blur radius in pixels.
-    blur: Option<u32>,
-    appimages: Vec<FileAppImage>,
+fn read_colors(fields: Option<Fields>) -> Colors {
+    let mut colors = Colors::default();
+    let Some(mut fields) = fields else { return colors };
+    let slots = [
+        ("background", &mut colors.background),
+        ("panel", &mut colors.panel),
+        ("foreground", &mut colors.foreground),
+        ("selection", &mut colors.selection),
+        ("accent", &mut colors.accent),
+        ("muted", &mut colors.muted),
+    ];
+    for (key, slot) in slots {
+        let Some(value) = fields.take::<String>(key) else { continue };
+        if parse_hex(&value).is_some() {
+            *slot = value;
+        } else {
+            eprintln!("launchr: config: ignoring colors.{key}: {value:?} is not a #rrggbb color");
+        }
+    }
+    fields.finish();
+    colors
+}
+
+fn read_appimages(list: Option<Vec<Value>>) -> Vec<AppImageConfig> {
+    let entries = list.unwrap_or_default().into_iter().enumerate();
+    entries
+        .filter_map(|(i, value)| read_appimage(Fields::new(value, format!("appimages[{i}]"))?))
+        .collect()
+}
+
+fn read_appimage(mut fields: Fields) -> Option<AppImageConfig> {
+    let name = fields.take::<String>("name");
+    let path = fields.take::<String>("path");
+    let icon = fields.take::<String>("icon").map(Icon::parse);
+    let entry = fields.prefix.trim_end_matches('.').to_owned();
+    fields.finish();
+
+    let (Some(name), Some(path)) = (name, path) else {
+        eprintln!("launchr: config: ignoring {entry}: it needs both a name and a path");
+        return None;
+    };
+    let path = expand_tilde(&path);
+    let problem = match std::fs::metadata(&path) {
+        _ if name.trim().is_empty() => Some("its name is empty"),
+        Ok(meta) if !meta.is_file() => Some("not a file"),
+        // Caught here rather than when it fails to start, which would close
+        // the launcher on a launch that never happened. Asked of the kernel
+        // rather than read off the mode bits: an execute bit for someone
+        // else's user or group is no use to this one.
+        Ok(_) if rustix::fs::access(&path, rustix::fs::Access::EXEC_OK).is_err() => {
+            Some("not executable (chmod +x)")
+        }
+        Ok(_) => None,
+        Err(_) => Some("no such file"),
+    };
+    if let Some(problem) = problem {
+        eprintln!("launchr: config: ignoring {entry} {path:?}: {problem}");
+        return None;
+    }
+    Some(AppImageConfig { name, path, icon })
 }
 
 /// Accepted ranges, shared with `cli::parse_args` so a value set in the file
@@ -178,10 +249,9 @@ pub const MAX_BLUR: u32 = 200;
 pub const WIDTH: std::ops::RangeInclusive<i32> = 240..=3000;
 
 fn config_path() -> Option<PathBuf> {
-    let xdg = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute());
-    let dir = xdg.or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).filter(|p| p.is_absolute());
+    let dir =
+        xdg.or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
     Some(dir.join("launchr.json"))
 }
 
@@ -203,20 +273,11 @@ fn parse_hex(hex: &str) -> Option<(u8, u8, u8)> {
 
 /// "r, g, b" for a hex color, for use inside an `rgba(...)` declaration.
 /// Callers only ever pass colors that have already been through
-/// [`valid_hex`] (or the built-in defaults), so the fallback here never
+/// [`parse_hex`] (or the built-in defaults), so the fallback here never
 /// actually triggers.
 pub fn rgb_triplet(hex: &str) -> String {
     let (r, g, b) = parse_hex(hex).unwrap_or((0, 0, 0));
     format!("{r}, {g}, {b}")
-}
-
-fn valid_hex(value: String, field: &str) -> Option<String> {
-    if parse_hex(&value).is_some() {
-        Some(value)
-    } else {
-        eprintln!("launchr: ignoring invalid color for {field}: {value:?}");
-        None
-    }
 }
 
 fn load() -> FileOverrides {
@@ -237,49 +298,33 @@ fn load_from(path: &Path) -> FileOverrides {
             return FileOverrides::default();
         }
     };
-    let file: FileConfig = match serde_json::from_str(&text) {
-        Ok(file) => file,
+    let map = match serde_json::from_str::<Map<String, Value>>(&text) {
+        Ok(map) => map,
         Err(err) => {
             eprintln!("launchr: cannot parse {}: {err}", path.display());
             return FileOverrides::default();
         }
     };
 
-    let mut colors = Colors::default();
-    if let Some(v) = file.colors.background.and_then(|v| valid_hex(v, "background")) {
-        colors.background = v;
-    }
-    if let Some(v) = file.colors.panel.and_then(|v| valid_hex(v, "panel")) {
-        colors.panel = v;
-    }
-    if let Some(v) = file.colors.foreground.and_then(|v| valid_hex(v, "foreground")) {
-        colors.foreground = v;
-    }
-    if let Some(v) = file.colors.selection.and_then(|v| valid_hex(v, "selection")) {
-        colors.selection = v;
-    }
-    if let Some(v) = file.colors.accent.and_then(|v| valid_hex(v, "accent")) {
-        colors.accent = v;
-    }
-    if let Some(v) = file.colors.muted.and_then(|v| valid_hex(v, "muted")) {
-        colors.muted = v;
-    }
-
-    let appimages = file.appimages.into_iter().filter_map(FileAppImage::into_config).collect();
-
-    FileOverrides {
-        colors,
-        font_size: file.font_size.map(|v| v.clamp(*FONT_SIZE.start(), *FONT_SIZE.end())),
-        lines: file.lines.map(|v| v.clamp(*LINES.start(), *LINES.end())),
-        dim: file.dim.map(|v| v.clamp(*DIM.start(), *DIM.end())),
-        blur: file.blur.map(|v| v.min(MAX_BLUR)),
-        appimages,
-    }
+    let mut file = Fields { map, prefix: String::new() };
+    let overrides = FileOverrides {
+        colors: read_colors(file.nested("colors")),
+        font_size: file
+            .take::<u32>("font_size")
+            .map(|v| v.clamp(*FONT_SIZE.start(), *FONT_SIZE.end())),
+        lines: file.take::<usize>("lines").map(|v| v.clamp(*LINES.start(), *LINES.end())),
+        dim: file.take::<f64>("dim").map(|v| v.clamp(*DIM.start(), *DIM.end())),
+        blur: file.take::<u32>("blur").map(|v| v.min(MAX_BLUR)),
+        appimages: read_appimages(file.take("appimages")),
+    };
+    file.finish();
+    overrides
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn parses_valid_hex() {
@@ -360,18 +405,50 @@ mod tests {
     }
 
     #[test]
-    fn appimage_entry_needs_a_real_file() {
-        let missing = FileAppImage {
-            name: "Ghost".to_owned(),
-            path: "/nonexistent/path/does-not-exist.AppImage".to_owned(),
-            icon: None,
-        };
-        assert!(missing.into_config().is_none());
+    fn a_mistyped_field_spoils_only_itself() {
+        let path = write_config(
+            "mistyped",
+            r##"{ "lines": "6", "dim": 0.5, "blur": true, "font-size": 30,
+                  "colors": { "accent": 5, "panel": "#000000", "accnet": "#ffffff" },
+                  "appimages": [ { "name": "No Path" }, 3 ] }"##,
+        );
+        let overrides = load_from(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(overrides.dim, Some(0.5));
+        assert_eq!(overrides.colors.panel, "#000000");
+        assert_eq!(overrides.lines, None);
+        assert_eq!(overrides.blur, None);
+        assert_eq!(overrides.font_size, None);
+        assert_eq!(overrides.colors.accent, Colors::default().accent);
+        assert!(overrides.appimages.is_empty());
+    }
+
+    fn appimage_entry(path: &Path, icon: &str) -> Fields {
+        let entry = serde_json::json!({ "name": "Real", "path": path, "icon": icon });
+        Fields::new(entry, "appimages[0]".to_owned()).unwrap()
+    }
+
+    #[test]
+    fn appimage_entry_needs_a_real_executable_file() {
+        let missing = Path::new("/nonexistent/path/does-not-exist.AppImage");
+        assert!(read_appimage(appimage_entry(missing, "app")).is_none());
 
         let path = write_file("appimage", "AppImage", "");
-        let real = FileAppImage { name: "Real".to_owned(), path: path.display().to_string(), icon: None };
-        let config = real.into_config().expect("existing file should be accepted");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let unrunnable = read_appimage(appimage_entry(&path, "app"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runnable = read_appimage(appimage_entry(&path, "app"));
         std::fs::remove_file(&path).ok();
+
+        assert!(unrunnable.is_none(), "a file without an execute bit cannot be launched");
+        let config = runnable.expect("an existing executable should be accepted");
         assert_eq!(config.name, "Real");
+        assert_eq!(config.icon, Some(Icon::Name("app".to_owned())));
+    }
+
+    #[test]
+    fn an_icon_with_a_slash_is_a_file() {
+        assert_eq!(Icon::parse("firefox".into()), Icon::Name("firefox".into()));
+        assert_eq!(Icon::parse("/opt/app.png".into()), Icon::File("/opt/app.png".into()));
     }
 }

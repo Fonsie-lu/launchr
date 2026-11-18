@@ -5,15 +5,16 @@
 //! wlroots-based. Capturing happens before the window is mapped, so the
 //! snapshot never contains the launcher itself.
 
+use crate::blur::Orientation;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use std::fs::File;
 use std::ops::Deref;
 use std::os::fd::{AsFd, OwnedFd};
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
-use wayland_client::globals::{registry_queue_init, GlobalListContents};
+use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool};
-use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, delegate_noop};
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
@@ -27,8 +28,12 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub stride: u32,
-    /// Byte offsets of red, green and blue within each 4 byte pixel.
-    pub channels: (usize, usize, usize),
+    /// Bit offsets of the top eight bits of red, green and blue in a pixel
+    /// read as a little endian `u32` — which is how every `wl_shm` format is
+    /// defined, so one rule covers 8 and 10 bits per channel alike.
+    pub channels: [u32; 3],
+    /// What turns the buffer into the picture on the output.
+    pub orientation: Orientation,
     pub data: Pixels,
 }
 
@@ -127,31 +132,27 @@ fn try_capture(deadline: Instant) -> Result<Vec<Frame>, String> {
     let qh = queue.handle();
 
     let shm: wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).map_err(|_| "no wl_shm")?;
-    let manager: ZwlrScreencopyManagerV1 = globals
-        .bind(&qh, 1..=3, ())
-        .map_err(|_| "no wlr-screencopy-v1")?;
-    let manager_version = manager.version();
+    let manager: ZwlrScreencopyManagerV1 =
+        globals.bind(&qh, 1..=3, ()).map_err(|_| "no wlr-screencopy-v1")?;
 
+    let mut state = State { shm, manager_version: manager.version(), outputs: Vec::new() };
     let outputs: Vec<_> = globals.contents().clone_list();
-    let mut state = State { shm, manager_version, outputs: Vec::new(), slots: Vec::new(), pending: 0 };
     for global in outputs.iter().filter(|g| g.interface == "wl_output") {
         let index = state.outputs.len();
-        let output: wl_output::WlOutput =
-            globals
-                .registry()
-                .bind(global.name, global.version.min(4), &qh, index);
-        state.outputs.push(Output { connector: None, proxy: output });
+        let proxy: wl_output::WlOutput =
+            globals.registry().bind(global.name, global.version.min(4), &qh, index);
+        state.outputs.push(Output::new(proxy));
     }
     if state.outputs.is_empty() {
         return Err("no outputs".to_owned());
     }
     // Requested before anything is waited on: the copies need only the output
     // proxies, so putting the framebuffer readback in flight first lets the
-    // connector names arrive alongside it rather than one round trip ahead.
-    for index in 0..state.outputs.len() {
-        manager.capture_output(0, &state.outputs[index].proxy, &qh, index);
-        state.slots.push(Slot::default());
-        state.pending += 1;
+    // output descriptions arrive alongside it rather than one round trip
+    // ahead. They arrive before the frames do in any case: the compositor
+    // sends them in answer to the bind, which it reads before these requests.
+    for (index, output) in state.outputs.iter().enumerate() {
+        manager.capture_output(0, &output.proxy, &qh, index);
     }
 
     // Bounded in wall clock, not in iterations: neither `blocking_dispatch` nor
@@ -160,27 +161,35 @@ fn try_capture(deadline: Instant) -> Result<Vec<Frame>, String> {
     //
     // Connector names only matter when there is more than one shot to pair with
     // a monitor; with one output there is nothing to pair and the wait ends as
-    // soon as the frame lands.
+    // soon as the frame lands. `wl_output` only has a name from version 4 on,
+    // so an older compositor's outputs are not waited on for one.
     let want_names = state.outputs.len() > 1;
-    wait_until(&mut queue, &mut state, deadline, "the compositor", |state| {
-        state.pending == 0
-            && (!want_names || state.outputs.iter().all(|o| o.connector.is_some()))
+    wait_until(&mut queue, &mut state, deadline, |state| {
+        state.outputs.iter().all(|output| {
+            output.slot.finished
+                && (!want_names || output.connector.is_some() || output.proxy.version() < 4)
+        })
     })?;
 
     let mut frames = Vec::new();
-    for (index, slot) in state.slots.iter().enumerate() {
-        if !slot.ready {
+    for output in &state.outputs {
+        let slot = &output.slot;
+        // A shot that cannot be paired with its monitor is worse than none:
+        // shown on the wrong one, it puts another output's desktop behind the
+        // panel. Only a lone output needs no name.
+        if !slot.ready || (want_names && output.connector.is_none()) {
             continue;
         }
-        let (Some(file), Some(format)) = (slot.file.as_ref(), slot.format) else { continue };
-        let size = (slot.stride * slot.height) as usize;
+        let (Some(file), Some(channels)) = (slot.file.as_ref(), slot.channels) else { continue };
+        let size = slot.stride as usize * slot.height as usize;
         let Some(mapping) = Mapping::new(file, size) else { continue };
         frames.push(Frame {
-            connector: state.outputs[index].connector.clone(),
+            connector: output.connector.clone(),
             width: slot.width,
             height: slot.height,
             stride: slot.stride,
-            channels: channel_offsets(format),
+            channels,
+            orientation: orientation(output.transform, slot.y_invert),
             data: Pixels::Mapped(mapping),
         });
     }
@@ -193,13 +202,12 @@ fn wait_until(
     queue: &mut EventQueue<State>,
     state: &mut State,
     deadline: Instant,
-    waiting_for: &str,
     done: impl Fn(&State) -> bool,
 ) -> Result<(), String> {
     while !done(state) {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() || !dispatch_before(queue, state, left)? {
-            eprintln!("launchr: screen capture timed out waiting for {waiting_for}");
+            eprintln!("launchr: screen capture timed out waiting for the compositor");
             return Ok(());
         }
     }
@@ -242,38 +250,81 @@ fn dispatch_before(
     Ok(true)
 }
 
-/// Byte offsets of R, G and B inside a 32 bit pixel of the given format.
-fn channel_offsets(format: wl_shm::Format) -> (usize, usize, usize) {
-    match format {
-        // Little endian 0xAARRGGBB lands in memory as B, G, R, A.
-        wl_shm::Format::Xrgb8888 | wl_shm::Format::Argb8888 => (2, 1, 0),
-        _ => (0, 1, 2),
-    }
+/// Where the top eight bits of red, green and blue sit in a pixel of
+/// `format`, read as a little endian `u32` (see `Frame::channels`), or `None`
+/// for a format the downscale cannot read.
+///
+/// The 10 bit formats are what an output driven at 10 bits per channel hands
+/// over. Without them such an output was never captured at all.
+fn channel_shifts(format: wl_shm::Format) -> Option<[u32; 3]> {
+    use wl_shm::Format;
+    Some(match format {
+        // 0xAARRGGBB: blue in the low byte.
+        Format::Xrgb8888 | Format::Argb8888 => [16, 8, 0],
+        Format::Xbgr8888 | Format::Abgr8888 => [0, 8, 16],
+        // 2 bits of alpha or padding above three 10 bit channels.
+        Format::Xrgb2101010 | Format::Argb2101010 => [22, 12, 2],
+        Format::Xbgr2101010 | Format::Abgr2101010 => [2, 12, 22],
+        _ => return None,
+    })
 }
 
-fn is_supported(format: wl_shm::Format) -> bool {
-    matches!(
-        format,
-        wl_shm::Format::Xrgb8888
-            | wl_shm::Format::Argb8888
-            | wl_shm::Format::Xbgr8888
-            | wl_shm::Format::Abgr8888
-    )
+/// What it takes to turn a captured buffer into the picture on the output.
+///
+/// Screencopy hands over the buffer as it is scanned out, which for a rotated
+/// or flipped output is not the picture its user sees; and a frame flagged
+/// `y_invert` stores its rows bottom up on top of that. The table was
+/// established against grim on an output in each of the eight transforms.
+pub(crate) fn orientation(transform: wl_output::Transform, y_invert: bool) -> Orientation {
+    use wl_output::Transform;
+    let (flip_x, flip_y, transpose) = match transform {
+        Transform::_90 => (false, true, true),
+        Transform::_180 => (true, true, false),
+        Transform::_270 => (true, false, true),
+        Transform::Flipped => (true, false, false),
+        Transform::Flipped90 => (false, false, true),
+        Transform::Flipped180 => (false, true, false),
+        Transform::Flipped270 => (true, true, true),
+        _ => (false, false, false),
+    };
+    // Mirrors commute, so the row order folds into the vertical one.
+    Orientation { flip_x, flip_y: flip_y ^ y_invert, transpose }
 }
 
 struct Output {
-    connector: Option<String>,
     proxy: wl_output::WlOutput,
+    connector: Option<String>,
+    transform: wl_output::Transform,
+    slot: Slot,
 }
 
+impl Output {
+    fn new(proxy: wl_output::WlOutput) -> Self {
+        Output {
+            proxy,
+            connector: None,
+            transform: wl_output::Transform::Normal,
+            slot: Slot::default(),
+        }
+    }
+}
+
+/// One output's frame as it comes together.
 #[derive(Default)]
 struct Slot {
+    /// Set together with the geometry below, from the first buffer type
+    /// offered whose format the downscale can read.
+    channels: Option<[u32; 3]>,
     format: Option<wl_shm::Format>,
     width: u32,
     height: u32,
     stride: u32,
+    y_invert: bool,
     file: Option<File>,
     requested: bool,
+    /// Nothing more is coming for this frame: it is ready, failed, or was
+    /// given up on.
+    finished: bool,
     ready: bool,
 }
 
@@ -281,27 +332,35 @@ struct State {
     shm: wl_shm::WlShm,
     manager_version: u32,
     outputs: Vec<Output>,
-    slots: Vec<Slot>,
-    pending: usize,
 }
 
 impl State {
-    /// Allocate the shm buffer and ask the compositor to fill it. No-op until
-    /// a usable format has been advertised, and only ever runs once per frame.
-    fn request_copy(&mut self, index: usize, frame: &ZwlrScreencopyFrameV1, qh: &QueueHandle<Self>) {
-        let slot = &mut self.slots[index];
-        if slot.requested || slot.format.is_none() {
+    /// Allocate the shm buffer and ask the compositor to fill it, once every
+    /// buffer type for the frame has been offered. Gives up on the frame
+    /// straight away if none of them is usable, rather than leaving the wait
+    /// to run into its deadline for a copy that will never be made.
+    fn request_copy(
+        &mut self,
+        index: usize,
+        frame: &ZwlrScreencopyFrameV1,
+        qh: &QueueHandle<Self>,
+    ) {
+        let slot = &mut self.outputs[index].slot;
+        if slot.requested || slot.finished {
             return;
         }
         let size = slot.stride as u64 * slot.height as u64;
-        let Some(fd) = memfd(size) else { return };
-        let pool = self.shm.create_pool(fd.as_fd(), size as i32, qh, ());
+        let (Some(format), Ok(pool_size)) = (slot.format, i32::try_from(size)) else {
+            return self.finish(index, frame, false);
+        };
+        let Some(fd) = memfd(size) else { return self.finish(index, frame, false) };
+        let pool = self.shm.create_pool(fd.as_fd(), pool_size, qh, ());
         let buffer = pool.create_buffer(
             0,
             slot.width as i32,
             slot.height as i32,
             slot.stride as i32,
-            slot.format.unwrap(),
+            format,
             qh,
             (),
         );
@@ -309,6 +368,13 @@ impl State {
         slot.file = Some(File::from(fd));
         slot.requested = true;
         frame.copy(&buffer);
+    }
+
+    fn finish(&mut self, index: usize, frame: &ZwlrScreencopyFrameV1, ready: bool) {
+        let slot = &mut self.outputs[index].slot;
+        slot.finished = true;
+        slot.ready = ready;
+        frame.destroy();
     }
 }
 
@@ -327,34 +393,32 @@ impl Dispatch<ZwlrScreencopyFrameV1, usize> for State {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
+        use zwlr_screencopy_frame_v1::{Event, Flags};
         match event {
-            zwlr_screencopy_frame_v1::Event::Buffer { format, width, height, stride } => {
-                let slot = &mut state.slots[index];
-                if slot.format.is_none() {
-                    if let WEnum::Value(format) = format {
-                        if is_supported(format) {
-                            slot.format = Some(format);
-                            slot.width = width;
-                            slot.height = height;
-                            slot.stride = stride;
-                        }
-                    }
+            Event::Buffer { format, width, height, stride } => {
+                let slot = &mut state.outputs[index].slot;
+                if slot.format.is_none()
+                    && let WEnum::Value(format) = format
+                    && let Some(channels) = channel_shifts(format)
+                {
+                    slot.format = Some(format);
+                    slot.channels = Some(channels);
+                    slot.width = width;
+                    slot.height = height;
+                    slot.stride = stride;
                 }
-                // Version 3 batches the formats and ends with buffer_done.
+                // Before version 3 this is the only buffer type offered;
+                // from 3 on the list ends with buffer_done.
                 if state.manager_version < 3 {
                     state.request_copy(index, frame, qh);
                 }
             }
-            zwlr_screencopy_frame_v1::Event::BufferDone => state.request_copy(index, frame, qh),
-            zwlr_screencopy_frame_v1::Event::Ready { .. } => {
-                state.slots[index].ready = true;
-                state.pending = state.pending.saturating_sub(1);
-                frame.destroy();
+            Event::BufferDone => state.request_copy(index, frame, qh),
+            Event::Flags { flags: WEnum::Value(flags) } => {
+                state.outputs[index].slot.y_invert = flags.contains(Flags::YInvert);
             }
-            zwlr_screencopy_frame_v1::Event::Failed => {
-                state.pending = state.pending.saturating_sub(1);
-                frame.destroy();
-            }
+            Event::Ready { .. } => state.finish(index, frame, true),
+            Event::Failed => state.finish(index, frame, false),
             _ => {}
         }
     }
@@ -369,8 +433,13 @@ impl Dispatch<wl_output::WlOutput, usize> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_output::Event::Name { name } = event {
-            state.outputs[index].connector = Some(name);
+        let output = &mut state.outputs[index];
+        match event {
+            wl_output::Event::Name { name } => output.connector = Some(name),
+            wl_output::Event::Geometry { transform: WEnum::Value(transform), .. } => {
+                output.transform = transform;
+            }
+            _ => {}
         }
     }
 }

@@ -8,11 +8,15 @@ use crate::config::AppImageConfig;
 use crate::matcher;
 use crate::usage::Usage;
 use gio_unix::DesktopAppInfo;
+use gio_unix::prelude::DesktopAppInfoExtManual;
 use gtk4::gio;
 use gtk4::gio::prelude::*;
+use gtk4::glib;
 use std::ffi::OsString;
+use std::fs::File;
 use std::ops::Deref;
-use std::process::{Command, Stdio};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::Path;
 
 /// How much a hit in each searchable field counts, relative to the name.
 mod weight {
@@ -127,7 +131,9 @@ fn desktop_item(usage: &Usage, info: gio::AppInfo) -> Option<(Entry, Target)> {
     if !generic.is_empty() {
         fields.push(field(&generic, weight::GENERIC_NAME));
     }
-    if let Some(exec) = info.executable().file_name() {
+    // `None` for a desktop file without an `Exec=` line, which GIO still
+    // lists when it is D-Bus activatable.
+    if let Some(exec) = info.executable().as_deref().and_then(Path::file_name) {
         fields.push(field(&exec.to_string_lossy(), weight::EXECUTABLE));
     }
     let keywords = with_untranslated(
@@ -189,15 +195,20 @@ pub struct LaunchEnv(Vec<(&'static str, Option<OsString>)>);
 
 impl LaunchEnv {
     /// Set each of `defaults` the environment does not already set, and
-    /// remember what was there. Must run before any thread is spawned: glibc's
-    /// `setenv` can reallocate `environ` under a thread reading it.
-    pub fn pin(defaults: &[(&'static str, &str)]) -> Self {
+    /// remember what was there.
+    ///
+    /// # Safety
+    ///
+    /// No other thread may exist yet: glibc's `setenv` can reallocate
+    /// `environ` under a thread reading it.
+    pub unsafe fn pin(defaults: &[(&'static str, &str)]) -> Self {
         let saved = defaults
             .iter()
             .map(|&(name, value)| {
                 let original = std::env::var_os(name);
                 if original.is_none() {
-                    std::env::set_var(name, value);
+                    // SAFETY: the caller guarantees this thread is the only one.
+                    unsafe { std::env::set_var(name, value) };
                 }
                 (name, original)
             })
@@ -205,7 +216,7 @@ impl LaunchEnv {
         LaunchEnv(saved)
     }
 
-    fn restore_on_context(&self, context: &gio::AppLaunchContext) {
+    fn restore_on(&self, context: &gio::AppLaunchContext) {
         for (name, original) in &self.0 {
             match original {
                 Some(value) => context.setenv(name, value),
@@ -213,46 +224,77 @@ impl LaunchEnv {
             }
         }
     }
+}
 
-    fn restore_on_command(&self, command: &mut Command) {
-        for (name, original) in &self.0 {
-            match original {
-                Some(value) => command.env(name, value),
-                None => command.env_remove(name),
-            };
+/// `path` as the `Exec=` line of a desktop entry that runs it with no
+/// arguments. GIO expands field codes in that line first and then splits it
+/// the way a shell would, so the path is shell quoted and any `%` in it
+/// doubled — a space or a `%` in a file name must not change what is run.
+fn exec_line(path: &Path) -> OsString {
+    let quoted = glib::shell_quote(path);
+    let mut line = Vec::with_capacity(quoted.len() + 2);
+    for &byte in quoted.as_bytes() {
+        line.push(byte);
+        if byte == b'%' {
+            line.push(b'%');
         }
     }
+    OsString::from_vec(line)
 }
 
 impl Target {
     /// Start the target with `env`'s original values restored. `context` is
-    /// the display's launch context; only a desktop entry uses it. The error
-    /// names what failed to start.
+    /// the display's launch context. The error names what failed to start.
+    ///
+    /// An AppImage goes through GIO too, as a desktop entry made up on the
+    /// spot, rather than through `std::process::Command`: that way it gets
+    /// the same environment handling and, from the launch context, the
+    /// activation token a compositor with focus stealing prevention wants to
+    /// see before it hands the new window the keyboard.
     pub fn launch(&self, env: &LaunchEnv, context: &gio::AppLaunchContext) -> Result<(), String> {
+        env.restore_on(context);
         match self {
-            Target::Desktop(info) => {
-                env.restore_on_context(context);
-                info.launch(&[] as &[gio::File], Some(context)).map_err(|error| {
-                    format!("{}: {error}", info.id().unwrap_or_default())
-                })
-            }
-            Target::AppImage(app) => {
-                let mut command = Command::new(&app.path);
-                command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-                env.restore_on_command(&mut command);
-                command
-                    .spawn()
-                    .map(drop)
-                    .map_err(|error| format!("{}: {error}", app.path.display()))
-            }
+            Target::Desktop(info) => info
+                .launch(&[] as &[gio::File], Some(context))
+                .map_err(|error| format!("{}: {error}", info.id().unwrap_or_default())),
+            Target::AppImage(app) => launch_appimage(app, context)
+                .map_err(|error| format!("{}: {error}", app.path.display())),
         }
     }
+}
+
+fn launch_appimage(app: &AppImageConfig, context: &gio::AppLaunchContext) -> Result<(), String> {
+    let info = gio::AppInfo::create_from_commandline(
+        exec_line(&app.path),
+        Some(&app.name),
+        gio::AppInfoCreateFlags::SUPPORTS_STARTUP_NOTIFICATION,
+    )
+    .map_err(|error| error.to_string())?
+    // On Unix every `AppInfo` GIO makes is a `GDesktopAppInfo`.
+    .downcast::<DesktopAppInfo>()
+    .map_err(|_| "not a desktop app info".to_owned())?;
+    // Not the launcher's own stdin/stdout/stderr: the AppImage outlives the
+    // launcher, and must not hold open a pipe it was started with — a
+    // script reading launchr's output would wait for the AppImage to exit.
+    let null =
+        File::options().read(true).write(true).open("/dev/null").map_err(|e| e.to_string())?;
+    info.launch_uris_as_manager_with_fds(
+        &[],
+        Some(context),
+        // What GIO's plain `launch` uses.
+        glib::SpawnFlags::SEARCH_PATH,
+        None,
+        None,
+        Some(&null),
+        Some(&null),
+        Some(&null),
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
 
     #[test]
     fn keywords_are_plain_words() {
@@ -265,20 +307,29 @@ mod tests {
         let both = with_untranslated("navigateur web".into(), Some("web browser".into()));
         assert_eq!(both, "navigateur web web browser");
         // An English desktop, or a file without translations: said once.
-        assert_eq!(with_untranslated("web browser".into(), Some("web browser".into())), "web browser");
+        assert_eq!(
+            with_untranslated("web browser".into(), Some("web browser".into())),
+            "web browser"
+        );
         assert_eq!(with_untranslated(String::new(), Some("browser".into())), "browser");
         assert_eq!(with_untranslated("browser".into(), None), "browser");
     }
 
     #[test]
-    fn a_launched_command_gets_the_original_environment_back() {
+    fn a_launched_app_gets_the_original_environment_back() {
         // What `pin` records: GTK_THEME was unset before launchr set it,
         // GSK_RENDERER was set to something of the user's own.
         let env = LaunchEnv(vec![("GTK_THEME", None), ("GSK_RENDERER", Some("gl".into()))]);
-        let mut command = Command::new("true");
-        env.restore_on_command(&mut command);
-        let envs: Vec<_> = command.get_envs().collect();
-        assert!(envs.contains(&(OsStr::new("GTK_THEME"), None)));
-        assert!(envs.contains(&(OsStr::new("GSK_RENDERER"), Some(OsStr::new("gl")))));
+        let context = gio::AppLaunchContext::new();
+        env.restore_on(&context);
+        let environment = context.environment();
+        assert!(environment.iter().any(|var| var == "GSK_RENDERER=gl"));
+        assert!(!environment.iter().any(|var| var.as_bytes().starts_with(b"GTK_THEME=")));
+    }
+
+    #[test]
+    fn an_exec_line_keeps_an_awkward_path_intact() {
+        let line = exec_line(Path::new("/opt/My App's 100%.AppImage"));
+        assert_eq!(line, r"'/opt/My App'\''s 100%%.AppImage'");
     }
 }

@@ -3,10 +3,11 @@
 
 use crate::apps::{Catalog, Entry, LaunchEnv, Target};
 use crate::blur;
-use crate::config::{self, Colors, Config};
+use crate::config::{self, Colors, Config, Icon};
 use crate::rank;
 use crate::timing;
 use gtk::gdk;
+use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
@@ -19,6 +20,9 @@ const STYLE: &str = include_str!("style.css");
 
 /// Shown for anything without an icon of its own.
 const FALLBACK_ICON: &str = "application-x-executable";
+
+/// Rows Page Up and Page Down move the highlight by.
+const PAGE: i32 = 5;
 
 /// One output's blurred screenshot, tagged with the connector it came from.
 pub struct Backdrop {
@@ -142,9 +146,13 @@ impl Row {
                     Some(gicon) => self.icon.set_from_gicon(&gicon),
                     None => self.icon.set_icon_name(Some(FALLBACK_ICON)),
                 },
-                Target::AppImage(app) => {
-                    self.icon.set_icon_name(Some(app.icon.as_deref().unwrap_or(FALLBACK_ICON)))
-                }
+                Target::AppImage(app) => match &app.icon {
+                    Some(Icon::Name(name)) => self.icon.set_icon_name(Some(name)),
+                    Some(Icon::File(path)) => {
+                        self.icon.set_from_gicon(&gio::FileIcon::new(&gio::File::for_path(path)))
+                    }
+                    None => self.icon.set_icon_name(Some(FALLBACK_ICON)),
+                },
             }
         }
         self.row.set_visible(true);
@@ -205,13 +213,9 @@ impl Results {
         }
     }
 
-    fn move_selection(&self, state: &RefCell<State>, delta: i32) {
+    fn move_selection(&self, state: &RefCell<State>, step: Step) {
         let len = state.borrow().shown.len();
-        if len == 0 {
-            return;
-        }
-        // Wrap around, like fuzzel does.
-        let next = (self.selected.get() as i32 + delta).rem_euclid(len as i32) as usize;
+        let Some(next) = step.from(self.selected.get(), len) else { return };
         self.selected.set(next);
         if let Some(row) = self.rows.get(next) {
             self.list.select_row(Some(&row.row));
@@ -234,6 +238,29 @@ impl Results {
     }
 }
 
+/// A move of the highlight through the result list.
+#[derive(Clone, Copy)]
+enum Step {
+    /// One row, wrapping around at either end, like fuzzel does.
+    Row(i32),
+    /// A jump of several rows, which stops at the ends instead: wrapping
+    /// would land a "page down" somewhere above where it started.
+    Page(i32),
+}
+
+impl Step {
+    /// The position this step leads to from `current` in a list of `len`
+    /// rows, or `None` for an empty list.
+    fn from(self, current: usize, len: usize) -> Option<usize> {
+        let last = len.checked_sub(1)? as i32;
+        let next = match self {
+            Step::Row(delta) => (current as i32 + delta).rem_euclid(len as i32),
+            Step::Page(delta) => (current as i32 + delta).clamp(0, last),
+        };
+        Some(next as usize)
+    }
+}
+
 /// Launch the entry at `position` in the displayed list and record the hit.
 fn activate(state: &RefCell<State>, env: &LaunchEnv, position: usize, window: &gtk::Window) {
     // Cloned out so no borrow is held while GIO launches.
@@ -245,8 +272,8 @@ fn activate(state: &RefCell<State>, env: &LaunchEnv, position: usize, window: &g
     };
     let Some((target, id)) = picked else { return };
 
-    let context = WidgetExt::display(window).app_launch_context();
-    let launched = match target.launch(env, context.upcast_ref()) {
+    let display = WidgetExt::display(window);
+    let launched = match target.launch(env, display.app_launch_context().upcast_ref()) {
         Ok(()) => true,
         Err(message) => {
             eprintln!("launchr: failed to launch {message}");
@@ -255,7 +282,12 @@ fn activate(state: &RefCell<State>, env: &LaunchEnv, position: usize, window: &g
     };
     // Close first: recording the launch flushes the store to disk, and there
     // is no reason for the launcher to stay on screen while that happens.
+    // Closing only queues the surface's destruction, though, and nothing
+    // would send it to the compositor before the main loop runs again — after
+    // the flushes — so it is pushed out here, which also hands the keyboard
+    // back for the app that is starting.
     window.close();
+    display.flush();
     if launched {
         state.borrow_mut().catalog.usage.record(&id);
     }
@@ -264,22 +296,25 @@ fn activate(state: &RefCell<State>, env: &LaunchEnv, position: usize, window: &g
 /// Pick the screenshot of the output the compositor put `window` on. Only
 /// known once the surface exists, so this runs on map.
 fn match_backdrop(window: &gtk::Window, picture: &gtk::Picture, backdrops: &[Backdrop]) {
-    // A single output skips the round trip that delivers connector names, so
-    // unnamed shots are the one case where whatever was captured is by
-    // definition the right one. Everything else has to be matched, including
-    // a lone shot left over from a multi-output capture where the other
-    // output failed.
+    // With more than one output the capture keeps only named shots, so an
+    // unnamed one means there was a single output, and its shot is by
+    // definition the right one. Everything else is matched, including a lone
+    // shot left over from a multi-output capture where the other output
+    // failed.
     if backdrops.iter().all(|b| b.connector.is_none()) {
         return;
     }
-    let Some(surface) = window.surface() else { return };
-    let Some(monitor) = WidgetExt::display(window).monitor_at_surface(&surface) else {
-        return;
-    };
     // No name from GDK is not the same as no match: without one there is
     // nothing to pair against, so leave the first shot in place rather than
     // blanking a backdrop that may well be correct.
-    let Some(connector) = monitor.connector() else { return };
+    let display = WidgetExt::display(window);
+    let Some(connector) = window
+        .surface()
+        .and_then(|surface| display.monitor_at_surface(&surface))
+        .and_then(|monitor| monitor.connector())
+    else {
+        return;
+    };
     match backdrops.iter().find(|b| b.connector.as_deref() == Some(connector.as_str())) {
         Some(found) => picture.set_paintable(Some(&found.texture)),
         // This output is named and nothing was captured for it. No backdrop
@@ -303,6 +338,98 @@ fn mark_first_frame(window: &gtk::Window) {
     });
 }
 
+/// The fullscreen layer-shell overlay everything else sits in. Closing it —
+/// on Escape, on activation, on a click outside the panel — is what quits the
+/// launcher: there is no `GtkApplication` to hold the process open, so the
+/// main loop ends with the window.
+fn overlay_window(main_loop: &glib::MainLoop) -> gtk::Window {
+    let window = gtk::Window::builder().css_classes(["launchr"]).build();
+    window.connect_close_request({
+        let main_loop = main_loop.clone();
+        move |_| {
+            main_loop.quit();
+            glib::Propagation::Proceed
+        }
+    });
+
+    // Anchored to every edge so the dim/blur covers the whole output.
+    window.init_layer_shell();
+    window.set_layer(Layer::Overlay);
+    window.set_namespace(Some(NAMESPACE));
+    window.set_keyboard_mode(KeyboardMode::Exclusive);
+    for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
+        window.set_anchor(edge, true);
+    }
+    window.set_exclusive_zone(-1);
+    window
+}
+
+/// Close `window` on a click anywhere on `area` outside `panel`.
+fn dismiss_on_click_outside(window: &gtk::Window, area: &gtk::Box, panel: &gtk::Box) {
+    let click = gtk::GestureClick::new();
+    click.connect_pressed({
+        let window = window.clone();
+        let panel = panel.clone();
+        move |gesture, _, x, y| {
+            let origin = gtk::graphene::Point::new(x as f32, y as f32);
+            if let Some(widget) = gesture.widget()
+                && let Some(point) = widget.compute_point(&panel, &origin)
+            {
+                let inside = point.x() >= 0.0
+                    && point.y() >= 0.0
+                    && point.x() <= panel.width() as f32
+                    && point.y() <= panel.height() as f32;
+                if !inside {
+                    window.close();
+                }
+            }
+        }
+    });
+    area.add_controller(click);
+}
+
+/// The launcher's keys, caught in the capture phase so the entry never sees
+/// them: Escape, Enter, and moving the highlight.
+fn handle_keys(
+    window: &gtk::Window,
+    state: &Rc<RefCell<State>>,
+    results: &Rc<Results>,
+    env: &Rc<LaunchEnv>,
+) {
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    keys.connect_key_pressed({
+        let state = state.clone();
+        let results = results.clone();
+        let env = env.clone();
+        let window = window.clone();
+        move |_, key, _, modifier| {
+            let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
+            // Lowered so Ctrl+N still moves with Caps Lock on.
+            let step = match key.to_lower() {
+                gdk::Key::Escape => {
+                    window.close();
+                    return glib::Propagation::Stop;
+                }
+                gdk::Key::Return | gdk::Key::KP_Enter => {
+                    activate(&state, &env, results.selected.get(), &window);
+                    return glib::Propagation::Stop;
+                }
+                gdk::Key::Down | gdk::Key::Tab => Step::Row(1),
+                gdk::Key::n | gdk::Key::j if ctrl => Step::Row(1),
+                gdk::Key::Up | gdk::Key::ISO_Left_Tab => Step::Row(-1),
+                gdk::Key::p | gdk::Key::k if ctrl => Step::Row(-1),
+                gdk::Key::Page_Down => Step::Page(PAGE),
+                gdk::Key::Page_Up => Step::Page(-PAGE),
+                _ => return glib::Propagation::Proceed,
+            };
+            results.move_selection(&state, step);
+            glib::Propagation::Stop
+        }
+    });
+    window.add_controller(keys);
+}
+
 pub fn build_ui(
     main_loop: &glib::MainLoop,
     config: &Config,
@@ -313,28 +440,7 @@ pub fn build_ui(
 ) {
     let state = Rc::new(RefCell::new(State { catalog, shown: Vec::new() }));
     let env = Rc::new(env);
-
-    let window = gtk::Window::builder().css_classes(["launchr"]).build();
-    // No GtkApplication to hold the process open, so the loop ends with the
-    // window: closing it on Escape, on activation or on a click outside is
-    // what quits the launcher.
-    window.connect_close_request({
-        let main_loop = main_loop.clone();
-        move |_| {
-            main_loop.quit();
-            glib::Propagation::Proceed
-        }
-    });
-
-    // Fullscreen overlay so the dim/blur covers the whole output.
-    window.init_layer_shell();
-    window.set_layer(Layer::Overlay);
-    window.set_namespace(Some(NAMESPACE));
-    window.set_keyboard_mode(KeyboardMode::Exclusive);
-    for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
-        window.set_anchor(edge, true);
-    }
-    window.set_exclusive_zone(-1);
+    let window = overlay_window(main_loop);
 
     let entry = gtk::Entry::builder()
         .placeholder_text(&config.placeholder)
@@ -356,17 +462,11 @@ pub fn build_ui(
     panel.append(&entry);
     panel.append(&results.list);
 
-    let dim = gtk::Box::builder()
-        .css_classes(["dim"])
-        .hexpand(true)
-        .vexpand(true)
-        .build();
+    let dim = gtk::Box::builder().css_classes(["dim"]).hexpand(true).vexpand(true).build();
     dim.append(&panel);
 
-    let picture = gtk::Picture::builder()
-        .content_fit(gtk::ContentFit::Fill)
-        .can_shrink(true)
-        .build();
+    let picture =
+        gtk::Picture::builder().content_fit(gtk::ContentFit::Fill).can_shrink(true).build();
     if let Some(first) = backdrops.first() {
         picture.set_paintable(Some(&first.texture));
     }
@@ -411,57 +511,8 @@ pub fn build_ui(
         move |_| activate(&state, &env, results.selected.get(), &window)
     });
 
-    let click = gtk::GestureClick::new();
-    click.connect_pressed({
-        let window = window.clone();
-        let panel = panel.clone();
-        move |gesture, _, x, y| {
-            let Some(widget) = gesture.widget() else { return };
-            let origin = gtk::graphene::Point::new(x as f32, y as f32);
-            // Anything outside the panel counts as "dismiss".
-            if let Some(point) = widget.compute_point(&panel, &origin) {
-                let inside = point.x() >= 0.0
-                    && point.y() >= 0.0
-                    && point.x() <= panel.width() as f32
-                    && point.y() <= panel.height() as f32;
-                if !inside {
-                    window.close();
-                }
-            }
-        }
-    });
-    dim.add_controller(click);
-
-    let keys = gtk::EventControllerKey::new();
-    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
-    keys.connect_key_pressed({
-        let state = state.clone();
-        let results = results.clone();
-        let window = window.clone();
-        move |_, key, _, modifier| {
-            let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
-            let step = match key {
-                gdk::Key::Escape => {
-                    window.close();
-                    return glib::Propagation::Stop;
-                }
-                gdk::Key::Return | gdk::Key::KP_Enter => {
-                    activate(&state, &env, results.selected.get(), &window);
-                    return glib::Propagation::Stop;
-                }
-                gdk::Key::Down | gdk::Key::Tab => 1,
-                gdk::Key::n | gdk::Key::j if ctrl => 1,
-                gdk::Key::Up | gdk::Key::ISO_Left_Tab => -1,
-                gdk::Key::p | gdk::Key::k if ctrl => -1,
-                gdk::Key::Page_Down => 5,
-                gdk::Key::Page_Up => -5,
-                _ => return glib::Propagation::Proceed,
-            };
-            results.move_selection(&state, step);
-            glib::Propagation::Stop
-        }
-    });
-    window.add_controller(keys);
+    dismiss_on_click_outside(&window, &dim, &panel);
+    handle_keys(&window, &state, &results, &env);
 
     results.reserve_full_height();
     // Fill the rows for the starting query before wiring up `changed`: the
@@ -469,11 +520,7 @@ pub fn build_ui(
     // signal repeat this same pass for nothing.
     results.refresh(&state, &config.query);
     timing::mark("rows filled");
-    entry.connect_changed({
-        let state = state.clone();
-        let results = results.clone();
-        move |entry| results.refresh(&state, &entry.text())
-    });
+    entry.connect_changed(move |entry| results.refresh(&state, &entry.text()));
 
     if timing::enabled() {
         mark_first_frame(&window);
@@ -482,4 +529,20 @@ pub fn build_ui(
     timing::mark("presented");
     entry.grab_focus();
     entry.set_position(-1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Step;
+
+    #[test]
+    fn a_row_step_wraps_and_a_page_step_stops_at_the_ends() {
+        assert_eq!(Step::Row(1).from(5, 6), Some(0));
+        assert_eq!(Step::Row(-1).from(0, 6), Some(5));
+        assert_eq!(Step::Page(5).from(1, 6), Some(5));
+        assert_eq!(Step::Page(-5).from(3, 6), Some(0));
+        assert_eq!(Step::Page(5).from(0, 20), Some(5));
+        assert_eq!(Step::Row(1).from(0, 0), None);
+        assert_eq!(Step::Page(5).from(0, 0), None);
+    }
 }

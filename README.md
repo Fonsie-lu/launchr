@@ -54,10 +54,11 @@ sudo ./install.sh --prefix /usr/local
 ./install.sh --uninstall
 ```
 
-The script checks for `cargo`, `pkg-config`, `gtk4` and `gtk4-layer-shell`, prints the package
-names for Arch, Fedora, Debian, openSUSE, Alpine and Void if something is missing, then builds
-and installs. It warns when the target directory is not on `PATH` and prints ready-made keybind
-lines for river, sway, niri and Hyprland. By hand it is just:
+Building needs Rust 1.88 or newer. The script checks for `cargo`, `pkg-config`, `gtk4` and
+`gtk4-layer-shell`, prints the package names for Arch, Fedora, Debian, openSUSE, Alpine and Void
+if something is missing, then builds and installs. It warns when the target directory is not on
+`PATH` and prints ready-made keybind lines for river, sway, niri and Hyprland. By hand it is
+just:
 
 ```bash
 cargo build --release
@@ -99,6 +100,8 @@ launchr [options]
 -h, --help          show this help
 ```
 
+Long options also take their value written in: `--lines=9`, `--blur=12`.
+
 Colors, font size, list length, dim, blur and a list of directly launchable AppImages can also
 be set in `~/.config/launchr.json` — see [Configuration](#configuration). Flags above override it.
 
@@ -107,7 +110,7 @@ be set in `~/.config/launchr.json` — see [Configuration](#configuration). Flag
 | type | filter |
 | `Down` / `Tab` / `Ctrl+n` / `Ctrl+j` | next result (wraps) |
 | `Up` / `Shift+Tab` / `Ctrl+p` / `Ctrl+k` | previous result (wraps) |
-| `PageDown` / `PageUp` | move five |
+| `PageDown` / `PageUp` | move five, stopping at the first or last row |
 | `Enter` or click | launch and record the hit |
 | `Escape` or click outside | dismiss |
 
@@ -152,12 +155,18 @@ overrides whatever the file says.
 - **`blur`** — same convention as `-b`/`--blur`: `0` (or omitted) is off, any other number is the
   radius in pixels.
 - **`appimages`** — entries with no `.desktop` file, launched directly instead of through GIO.
-  `path` accepts a leading `~/`. `icon` is an icon *name* looked up in the current icon theme
-  (not a file path); omit it to get a generic executable icon. An entry whose `path` doesn't
-  resolve to a file, or whose `name` is empty, is skipped with a warning rather than failing the
-  whole file. Launch counts for AppImages are tracked the same way as for regular applications.
+  `path` accepts a leading `~/`. `icon` is either an icon *name* looked up in the current icon
+  theme or, if it contains a `/`, an image file (`~/` works there too); omit it to get a generic
+  executable icon. An entry whose `path` isn't an executable file, or whose `name` is empty, is
+  skipped with a warning rather than failing the whole file. AppImages are started through GIO
+  exactly like desktop entries, so they get the same activation token (focus on compositors
+  that require one) and the same environment; their stdin, stdout and stderr are `/dev/null`. Launch counts for AppImages are tracked the same
+  way as for regular applications.
 
-Malformed JSON, or a file that can't be read at all (other than simply not existing), is
+Every setting is read on its own: a value of the wrong type (`"lines": "6"`), an invalid color,
+or a broken `appimages` entry is reported on stderr and skipped, and the rest of the file still
+applies. A key launchr doesn't know — usually a typo like `font-size` — is reported the same
+way. Malformed JSON, or a file that can't be read at all (other than simply not existing), is
 reported on stderr and the launcher falls back to built-in defaults rather than refusing to
 start.
 
@@ -179,6 +188,13 @@ starts up, so part of it is free — but only part.
 
 With more than one output, each is captured, and the shot is paired with the monitor the
 compositor put the layer surface on by connector name (`DP-1`, `HDMI-A-1`).
+
+Screencopy hands over an output's buffer as the hardware scans it out, which for a rotated or
+flipped output (portrait monitors) is not the picture on screen. launchr reads the output's
+transform and turns the shot upright at no extra cost: the mirrors are folded into the
+downscale's reads, the quarter turn into the blur's own transposition. 8-bit and 10-bit per
+channel formats (`XRGB8888`, `XRGB2101010` and their alpha/BGR variants) are understood; an
+output offered nothing usable is given up on at once rather than waited out.
 
 ## Startup
 
@@ -220,7 +236,8 @@ launchr:   144.2ms  first frame
 between the main thread's marks. `first frame` is the end of the first paint, not the start of
 it: the paint itself is some 35ms of software rendering at this size. Neither wait is
 unbounded: every compositor exchange after the registry is up runs on a 300ms deadline, and the
-main thread gives the whole worker 900ms before it settles for a dim-only window.
+main thread gives the whole worker 900ms from the moment it was spawned before it settles for
+a dim-only window.
 
 What is left is nearly all GTK — opening the display, loading styles (`css loaded`), measuring
 and mapping the surface, and the first paint — so if a machine is slower than this, that is the
@@ -239,9 +256,10 @@ count	last_used_unix	desktop_id
 ```
 
 Delete the file to reset the ranking, or edit it to pin something to the top. Unparsable lines
-are skipped rather than fatal, and writes go through a temp file that is flushed to disk before
-being renamed into place, so neither an interrupted launch nor a power cut can truncate the
-store.
+are skipped rather than fatal, and writes go through a per-process temp file that is flushed to
+disk before being renamed into place, so neither an interrupted launch, a power cut, nor two
+launchers recording at once can truncate the store. The launcher is gone from the screen
+before that flush starts.
 
 ## Layout
 
@@ -273,7 +291,9 @@ cargo test
 ```
 
 Covers the scorer's ordering guarantees (prefix over scattered, word start over mid-word,
-shorter name on a tie), the ranking policy (popularity versus match quality, tie breaks), flag
-parsing and the config file's clamping and fallbacks, the blur's flat-image/point-spread/
-brightness/transpose behaviour and its buffer checks, and the usage store's round trip and
-corrupt-line handling.
+shorter name on a tie) and its folding of accents and combining marks, the ranking policy
+(popularity versus match quality, tie breaks), flag parsing including `--flag=value`, the config
+file's clamping and per-field fallbacks, the blur's flat-image/point-spread/brightness/transpose
+behaviour, its buffer checks, pixel formats and all eight output transforms (checked against
+what a real wlroots output hands over), the launch environment and AppImage command line, the
+result list's selection steps, and the usage store's round trip and corrupt-line handling.

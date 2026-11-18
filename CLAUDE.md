@@ -12,19 +12,26 @@ frame, so most of the architecture exists to make startup work overlap rather th
 
 ```bash
 cargo build --release        # optimized build (lto, codegen-units=1, panic=abort — see Cargo.toml)
-cargo test                    # unit tests: matcher, ranking, CLI, config, blur image ops, usage store
+cargo test                    # unit tests: matcher, ranking, CLI, config, blur image ops, usage store, launch env
 cargo test <name>             # run a single test by name/substring
 ./install.sh                  # build + install to ~/.local/bin (checks for gtk4/gtk4-layer-shell deps)
 LAUNCHR_TIMING=1 cargo run --release -- -b   # print the startup timing breakdown to stderr
 ```
 
-`.github/workflows/ci.yml` gates every push and pull request on
+`.github/workflows/ci.yml` gates every push and pull request on `cargo fmt --check`,
 `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked` and
-`cargo build --release --locked`, so a new warning fails CI — run clippy before pushing.
+`cargo build --release --locked`, so a new warning or an unformatted line fails CI — run
+`cargo fmt` and clippy before pushing. `rustfmt.toml` sets `use_small_heuristics = "Max"`.
 
-Manual testing requires a wlroots-based Wayland session (river, sway, Hyprland, Wayfire) since
-the app uses `wlr-layer-shell` for the window and `wlr-screencopy-v1` for the blur backdrop —
-it cannot be exercised meaningfully in a headless/X11 environment.
+Edition 2024, `rust-version = "1.88"` (let chains, `slice::as_chunks`). In this edition
+`std::env::set_var`/`remove_var` are `unsafe`; the only callers are `LaunchEnv::pin` and
+`take_activation_token`, both `unsafe fn`s called from one `unsafe` block at the top of `main` —
+keep it that way (see "Startup sequencing").
+
+Manual testing requires a wlroots-based Wayland compositor (river, sway, Hyprland, Wayfire) since
+the app uses `wlr-layer-shell` for the window and `wlr-screencopy-v1` for the blur backdrop — it
+cannot be exercised under X11. A nested headless wlroots compositor is enough, and keeps the
+test off the real desktop (see the orientation note below).
 
 ## Architecture
 
@@ -34,34 +41,51 @@ Everything lives flat under `src/`, no submodule tree:
 | --- | --- |
 | `src/main.rs` | startup sequence only: env pinning, which work runs on which thread, the backdrop wait |
 | `src/cli.rs` | `parse_args` and the `--help` text — the last `Config` layer |
-| `src/config.rs` | `Config` (the merged settings) and `~/.config/launchr.json` loading/validation: `Colors`, `AppImageConfig`, clamp ranges, per-field fallback to defaults with a stderr warning on anything invalid |
-| `src/apps.rs` | `Catalog::load` (usage store + GIO desktop entries + AppImages → `Entry`/`Target`), `Target::launch`, `LaunchEnv` |
+| `src/config.rs` | `Config` (the merged settings) and `~/.config/launchr.json` loading/validation: `Colors`, `AppImageConfig`/`Icon`, clamp ranges. The file is read as a `serde_json` map through `Fields`, one key at a time, so a mistyped value, a bad color or a broken `appimages` entry falls back on its own with a stderr warning, and keys left over at the end are reported as unknown. No serde derive |
+| `src/apps.rs` | `Catalog::load` (usage store + GIO desktop entries + AppImages → `Entry`/`Target`), `Target::launch`, `LaunchEnv`, `exec_line` |
 | `src/rank.rs` | `rank` — the whole ranking policy — plus `weigh`, `popularity_bonus`, `take_top` |
 | `src/ui.rs` | layer-shell window, widget tree, stylesheet rendering, result rows (`Results`/`Row`), key handling, activation |
-| `src/capture.rs` | standalone `wlr-screencopy-v1` client over its own Wayland connection (raw `wayland-client`, not GTK's) |
-| `src/blur.rs` | pure image ops: downscale + 3-pass separable box blur approximating Gaussian |
+| `src/capture.rs` | standalone `wlr-screencopy-v1` client over its own Wayland connection (raw `wayland-client`, not GTK's). Also the protocol knowledge the blur needs: `channel_shifts` (8- and 10-bit `wl_shm` formats as bit offsets in a little-endian `u32`) and `orientation` (output transform + `y_invert` → `blur::Orientation`) |
+| `src/blur.rs` | pure image ops: downscale + 3-pass separable box blur approximating Gaussian, with the output's orientation folded in (mirrors in the downscale's reads, the transposition in the blur's) |
 | `src/matcher.rs` | fuzzy subsequence scorer plus `fold` (lowercase + strip diacritics), no GTK dependency |
 | `src/usage.rs` | launch-count store (`$XDG_DATA_HOME/launchr/usage.tsv`), used both for ranking and to record hits |
 | `src/timing.rs` | `LAUNCHR_TIMING=1` marks |
 | `src/style.css` | Tokyo Night stylesheet *template* — `__TOKEN__` placeholders substituted by `render_style()` in `ui.rs` from `Config::colors`/`font_size`/`dim`, then loaded as a single provider above `GTK_STYLE_PROVIDER_PRIORITY_USER` so it cannot be overridden by the user's GTK theme — one provider, not two, because each one added to a display invalidates the whole style cascade again. It must style every widget on its own: the built-in theme underneath is GTK's blank `Empty` (see below) |
 
-`matcher.rs`, `blur.rs`, `usage.rs`, `config.rs`, `cli.rs`, `rank.rs` and `apps.rs`'s
-`LaunchEnv` are unit-tested in isolation (`#[cfg(test)]` blocks at the bottom of each file). The
-two policy decisions are kept GTK-free so they are testable: `parse_args` takes the argument
-iterator as a parameter, and `rank` works on `Entry`, which holds no GIO or GTK type.
-`capture.rs`, `Catalog::load` and the widget wiring are only exercised by running the app.
+`matcher.rs`, `blur.rs`, `usage.rs`, `config.rs`, `cli.rs`, `rank.rs`, `apps.rs`'s `LaunchEnv`
+and `exec_line`, and `ui.rs`'s `Step` are unit-tested in isolation (`#[cfg(test)]` blocks at the
+bottom of each file). The two policy decisions are kept GTK-free so they are testable:
+`parse_args` takes the argument iterator as a parameter, and `rank` works on `Entry`, which holds
+no GIO or GTK type. File-backed code takes its path as a parameter (`config::load_from`,
+`Usage::load_from`) so tests never touch the user's files — and never call `set_var`, which
+races every other test thread reading the environment. `capture.rs`'s Wayland exchange,
+`Catalog::load` and the widget wiring are only exercised by running the app.
+
+The orientation table in `capture::orientation` is pinned by
+`blur::tests::every_output_transform_comes_out_upright`, whose fixture is what a headless wlroots
+output actually handed over in each of the eight transforms (grim saw the picture upright every
+time). To re-derive it: run river headless (`WLR_BACKENDS=headless WLR_RENDERER=pixman river`),
+show an asymmetric image with `swaybg`, `wlr-randr --output HEADLESS-1 --transform …`, and dump
+the raw frames from a throwaway test that calls `capture::capture_outputs`. The same nested
+compositor is how to run the launcher itself headless (`WAYLAND_DISPLAY=wayland-N launchr -b`,
+then `grim`).
 
 ### Config precedence
 
 `Config` (in `config.rs`) is built in three layers, each overriding the last: built-in defaults
 (`Config::default()`) → `~/.config/launchr.json` (`Config::with_file_overrides`) → CLI flags
-(`cli::parse_args`, which takes the already-merged config as its starting point). Only `lines`,
-`dim`, and `blur` are settable from both the file and a flag; `colors`, `font_size`, and `appimages` are file-only, and `width`,
-`placeholder`, and `query` are flag-only. AppImages get folded into the same `Entry`/`Target` list
-as `.desktop` entries in `Catalog::load`, so search, ranking, and `usage.tsv` popularity tracking
-treat them identically — the only branch point is `Target::Desktop` vs. `Target::AppImage` in
-`Row::show` (icon lookup) and `Target::launch` (`AppInfo::launch` vs. a plain
-`std::process::Command`).
+(`cli::parse_args`, which takes the already-merged config as its starting point; long options
+also accept `--flag=value`). Only `lines`, `dim`, and `blur` are settable from both the file and
+a flag; `colors`, `font_size`, and `appimages` are file-only, and `width`, `placeholder`, and
+`query` are flag-only. AppImages get folded into the same `Entry`/`Target` list as `.desktop`
+entries in `Catalog::load`, so search, ranking, and `usage.tsv` popularity tracking treat them
+identically — the only branch point is `Target::Desktop` vs. `Target::AppImage` in
+`Row::show` (icon lookup: an AppImage's `Icon::Name` or `Icon::File`) and `Target::launch`, where
+an AppImage gets a `gio::AppInfo` made on the spot with `create_from_commandline` from
+`exec_line` (shell-quoted, `%` doubled — GIO expands field codes, then shell-splits) and is
+started with `launch_uris_as_manager_with_fds` (`gio-unix`'s `v2_58` feature) so its stdio is
+`/dev/null`, as it always was. Both go through the same `AppLaunchContext`, so both get
+`LaunchEnv`'s restored environment and an xdg-activation token.
 
 ### Startup sequencing (the part that matters for perf-sensitive changes)
 
@@ -69,8 +93,8 @@ The core design constraint: worker threads start *before* `gtk::init`, and are j
 right before the window is mapped — the one ordering invariant that must hold is "screenshot
 before map" (the launcher must never capture itself).
 
-- `GSK_RENDERER` and `GTK_THEME` are pinned by `LaunchEnv::pin` as the first statement of
-  `main`, before any thread exists. Not a style choice: glibc's `setenv` can reallocate
+- `GSK_RENDERER` and `GTK_THEME` are pinned by `LaunchEnv::pin` in the `unsafe` block at the
+  top of `main`, before any thread exists. Not a style choice: glibc's `setenv` can reallocate
   `environ`, and both workers below read the environment (`XDG_DATA_DIRS` and the locale
   variables for the catalog, `WAYLAND_DISPLAY` for the capture), so writing to it once they are
   running is a data race. Keep any new `set_var` above the spawns — add it to the `pin` list so
@@ -96,12 +120,22 @@ before map" (the launcher must never capture itself).
   own, so `capture.rs` waits through `wait_until`/`dispatch_before` (`poll` with a deadline)
   instead of either — while `BACKDROP_WAIT` (900ms) is the outer bound and must stay larger than
   that deadline plus the connection setup outside it plus the blur, or a capture that succeeded
-  gets thrown away after paying for the whole framebuffer readback. The blur runs its three
-  horizontal passes back to back, transposes once for the vertical ones, and divides by
-  reciprocal multiply (`blur::Divisor`); keep it and the downscale rounding, not truncating, or
-  the passes darken the backdrop.
+  gets thrown away after paying for the whole framebuffer readback. Both budgets are counted
+  from the moment the worker is spawned (`CaptureJob::give_up_at`), not from when the main
+  thread starts waiting. A frame whose offered buffer types include no format `channel_shifts`
+  can read is given up on at once (`State::finish`) instead of waiting out the deadline, and
+  connector names are only waited for from outputs bound at `wl_output` version 4 or later.
+  The blur runs its three horizontal passes back to back, transposes once for the vertical
+  ones, and divides by reciprocal multiply (`blur::Divisor`); keep it and the downscale
+  rounding, not truncating, or the passes darken the backdrop. Pixels are read as little-endian
+  `u32`s and shifted (`Frame::channels`), which costs ~0.15ms over byte loads on a 2560x1440
+  frame and is what lets 10-bit outputs be captured at all.
 - Multi-output setups pair each captured frame with the output the compositor placed the layer
   surface on, matched by connector name (`DP-1`, `HDMI-A-1`, etc.).
+- Screencopy frames arrive in buffer orientation, not as the user sees the output. The
+  `wl_output` geometry's transform and the frame's `y_invert` flag become a
+  `blur::Orientation`; `downscale` reads blocks mirrored and `box_blur` skips its second
+  transpose when a quarter turn is needed, so turning the image upright adds no pass.
 - Three env-driven defaults exist purely to avoid paying for things a short-lived process never
   needs, each overridable: no `GtkApplication` (skips session-bus registration), `GSK_RENDERER=cairo`
   (skips GL/Vulkan context setup — GL and Vulkan both measured slower to first paint),
@@ -151,11 +185,13 @@ lower weight than the app name (`apps::weight`) but are never displayed.
 ## Release process
 
 Releases are published from `.github/workflows/release.yml`, triggered by tagging `vX.Y.Z` (or a
-manual `workflow_dispatch` with an existing tag): it runs `cargo test --release`, builds
-`--release --locked`, packages `target/release/launchr` + `README.md` into a
+manual `workflow_dispatch` with an existing tag, which re-uploads its assets): it checks the tag
+against `Cargo.toml`'s version, runs `cargo test --release --locked`, builds `--release
+--locked`, packages `target/release/launchr` + `README.md` into a
 `launchr-<version>-x86_64-unknown-linux-gnu.tar.gz` with a `.sha256`, and publishes both as a
-GitHub release.
+GitHub release. Bump `version` in `Cargo.toml` (and the `V=` line in the README) before tagging.
 
-**That workflow is described here but does not exist in the repository** — only `ci.yml` does.
-Write it before cutting a release. `gtk4-layer-shell` is only packaged from Ubuntu 24.10 on, so
-it needs the same meson/ninja fallback `ci.yml` already carries.
+Both workflows install GTK through the composite action `.github/actions/setup-gtk`, which
+carries the meson/ninja fallback for `gtk4-layer-shell` (only packaged from Ubuntu 24.10 on).
+`.github/dependabot.yml` opens weekly update PRs for crates (gtk-rs and wayland grouped) and
+for the actions themselves.

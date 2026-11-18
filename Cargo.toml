@@ -1,19 +1,24 @@
 [package]
 name = "launchr"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+# let chains and `slice::as_chunks`.
+rust-version = "1.88"
 description = "Wayland application launcher with popularity-based ranking"
 license = "MIT"
 
 [dependencies]
-gtk4 = { version = "0.11", features = ["v4_12"] }
-gtk4-layer-shell = "0.8"
-wayland-client = "0.31"
-wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-rustix = { version = "1", features = ["event", "fs", "mm"] }
-serde = { version = "1", features = ["derive"] }
+# 0.11.5 / 0.22.11: `AppInfo::executable` returns an `Option`, as the C API
+# always could; the older bindings turned a NULL into a `PathBuf` regardless.
+gtk4 = { version = "0.11.5", features = ["v4_12"] }
+gtk4-layer-shell = "0.8.1"
+wayland-client = "0.31.15"
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+rustix = { version = "1.1", features = ["event", "fs", "mm"] }
+serde = "1"
 serde_json = "1"
-gio-unix = "0.22"
+# v2_58: launching with stdio of our choosing (`launch_uris_as_manager_with_fds`).
+gio-unix = { version = "0.22.11", features = ["v2_58"] }
 libc = "0.2"
 
 [profile.release]

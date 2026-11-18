@@ -37,17 +37,28 @@ impl Folded {
 /// Lowercase `text` and strip the diacritics off the Latin letters, so `cafe`
 /// finds `Café` and `okular` finds `Okular`. Characters outside the folded
 /// range are passed through lowercased.
+///
+/// Combining marks are dropped outright. A desktop file written in decomposed
+/// form spells `é` as `e` plus U+0301, and lowercasing `İ` gives `i` plus
+/// U+0307 — either way the mark would sit between the letters a query types.
 fn fold(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         for lower in c.to_lowercase() {
             match fold_char(lower) {
                 Some(plain) => out.push_str(plain),
+                None if is_combining_mark(lower) => {}
                 None => out.push(lower),
             }
         }
     }
     out
+}
+
+/// The Combining Diacritical Marks block, which is what decomposed Latin
+/// text is made of.
+fn is_combining_mark(c: char) -> bool {
+    matches!(c, '\u{0300}'..='\u{036f}')
 }
 
 /// Latin-1 Supplement and Latin Extended-A, which is every accented letter a
@@ -99,11 +110,8 @@ pub fn score(needle: &Folded, hay: &Folded) -> Option<i32> {
     // of the list for any query worth typing — pays for the search below, which
     // costs a pass over the haystack per needle character.
     let greedy = greedy_chain(&needle.chars, &hay.chars)?;
-    let mut total = if hay.chars.len() <= DP_LIMIT {
-        best_chain(&needle.chars, &hay.chars)
-    } else {
-        greedy
-    };
+    let mut total =
+        if hay.chars.len() <= DP_LIMIT { best_chain(&needle.chars, &hay.chars) } else { greedy };
 
     // Contiguous hits beat scattered ones, short names beat long ones.
     if hay.text.starts_with(&needle.text) {
@@ -222,7 +230,7 @@ fn greedy_chain(needle: &[char], hay: &[char]) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fold, score, Folded, DP_LIMIT};
+    use super::{DP_LIMIT, Folded, fold, score};
 
     fn s(needle: &str, hay: &str) -> Option<i32> {
         score(&Folded::new(needle), &Folded::new(hay))
@@ -293,6 +301,15 @@ mod tests {
         assert_eq!(fold("Größe"), "grosse");
         assert_eq!(fold("ŁÓDŹ"), "lodz");
         assert_eq!(fold("Ægir"), "aegir");
+    }
+
+    #[test]
+    fn folding_drops_combining_marks() {
+        // "Café" with the accent as a separate code point, as a desktop file
+        // written in decomposed form has it.
+        assert_eq!(fold("Cafe\u{301}"), "cafe");
+        assert_eq!(fold("İstanbul"), "istanbul");
+        assert!(s("istan", "İstanbul Guide").is_some());
     }
 
     #[test]

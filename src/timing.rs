@@ -20,9 +20,9 @@ pub fn enabled() -> bool {
 }
 
 pub fn mark(label: &str) {
-    if enabled() {
-        if let Some(start) = START.get() {
-            eprintln!("launchr: {:7.1}ms  {label}", start.elapsed().as_secs_f64() * 1000.0);
-        }
+    if enabled()
+        && let Some(start) = START.get()
+    {
+        eprintln!("launchr: {:7.1}ms  {label}", start.elapsed().as_secs_f64() * 1000.0);
     }
 }

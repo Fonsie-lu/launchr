@@ -182,16 +182,9 @@ path.
 `Comment=`/`Keywords=`/`GenericName=` are folded into the searchable text at
 lower weight than the app name (`apps::weight`) but are never displayed.
 
-## Release process
+## CI setup
 
-Releases are published from `.github/workflows/release.yml`, triggered by tagging `vX.Y.Z` (or a
-manual `workflow_dispatch` with an existing tag, which re-uploads its assets): it checks the tag
-against `Cargo.toml`'s version, runs `cargo test --release --locked`, builds `--release
---locked`, packages `target/release/launchr` + `README.md` into a
-`launchr-<version>-x86_64-unknown-linux-gnu.tar.gz` with a `.sha256`, and publishes both as a
-GitHub release. Bump `version` in `Cargo.toml` (and the `V=` line in the README) before tagging.
-
-Both workflows install GTK through the composite action `.github/actions/setup-gtk`, which
+The CI workflow installs GTK through the composite action `.github/actions/setup-gtk`, which
 carries the meson/ninja fallback for `gtk4-layer-shell` (only packaged from Ubuntu 24.10 on).
 `.github/dependabot.yml` opens weekly update PRs for crates (gtk-rs and wayland grouped) and
 for the actions themselves.

@@ -29,23 +29,6 @@ type, fuzzy match, hit Enter. Built on GTK4 + `wlr-layer-shell`.
   query, the count is a log-scaled boost on top of the fuzzy match score, so a frequently used
   app wins ties but cannot bury a much better name match.
 
-## Install a release binary
-
-x86_64 glibc build from the [releases page](https://github.com/Fonsie-lu/launchr/releases/latest):
-
-```bash
-V=0.1.0
-curl -LO https://github.com/Fonsie-lu/launchr/releases/download/v$V/launchr-$V-x86_64-unknown-linux-gnu.tar.gz
-curl -LO https://github.com/Fonsie-lu/launchr/releases/download/v$V/launchr-$V-x86_64-unknown-linux-gnu.tar.gz.sha256
-sha256sum -c launchr-$V-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar xzf launchr-$V-x86_64-unknown-linux-gnu.tar.gz
-install -Dm755 launchr-$V-x86_64-unknown-linux-gnu/launchr ~/.local/bin/launchr
-```
-
-The binary is dynamically linked, so GTK4 and `gtk4-layer-shell` still have to be installed —
-the runtime libraries only, not the `-dev`/`-devel` packages. On a musl distro, or for anything
-other than x86_64, build from source instead.
-
 ## Build and install
 
 ```bash
